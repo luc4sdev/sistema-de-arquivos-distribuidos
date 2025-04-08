@@ -1,0 +1,25 @@
+{
+  "name": "sistema-de-arquivos-distribuidos",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app.js",
+    "client": "node dist/client.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.13.13",
+    "canvas": "^3.1.0",
+    "chart.js": "^4.4.8",
+    "chartjs-node-canvas": "^5.0.0",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "typescript": "^5.8.2"
+  }
+}
