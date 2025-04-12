@@ -8,6 +8,10 @@ export class FileClient {
         this.socketClient = new SocketClient(serverUrl);
     }
 
+    public onConnect(callback: () => void) {
+        this.socketClient.onConnect(callback);
+    }
+
     public async createFile(filename: string, content: string): Promise<FileOperationResponse> {
         return new Promise((resolve) => {
             this.socketClient.createFile(

@@ -1,14 +1,12 @@
-import { FileClient } from './client/FileClient';
+import { Cli } from './client/Cli';
 
 async function main() {
-    const fileClient = new FileClient();
+    const cli = new Cli();
 
     try {
-        await fileClient.runExampleOperations();
+        await cli.start();
     } catch (error) {
         console.error('Erro no cliente:', error);
-    } finally {
-        //setTimeout(() => fileClient.disconnect(), 5000);
     }
 }
 

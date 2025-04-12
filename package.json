@@ -5,7 +5,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/app.js",
-    "client": "node dist/client.js"
+    "client": "node dist/client.js",
+    "dev": "ts-node src/client.ts",
+    "dev:server": "ts-node src/app.ts"
   },
   "keywords": [],
   "author": "",
@@ -21,5 +23,8 @@
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
     "typescript": "^5.8.2"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2"
   }
 }
