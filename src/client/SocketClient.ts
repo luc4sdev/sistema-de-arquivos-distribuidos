@@ -5,6 +5,9 @@ import {
     ReadFilePayload,
     WriteFilePayload,
     DeleteFilePayload,
+    ListFilesPayload,
+    CopyFilePayload,
+    DownloadFilePayload,
 } from '../types';
 
 export class SocketClient {
@@ -39,6 +42,18 @@ export class SocketClient {
 
     public deleteFile(payload: DeleteFilePayload, callback: (response: FileOperationResponse) => void) {
         this.socket.emit('delete', payload, callback);
+    }
+
+    public listFiles(payload: ListFilesPayload, callback: (response: FileOperationResponse) => void) {
+        this.socket.emit('list', payload, callback);
+    }
+
+    public copyFile(payload: CopyFilePayload, callback: (response: FileOperationResponse) => void) {
+        this.socket.emit('copy', payload, callback);
+    }
+
+    public downloadFile(payload: DownloadFilePayload, callback: (response: FileOperationResponse) => void) {
+        this.socket.emit('download', payload, callback);
     }
 
     public onConnect(callback: () => void) {

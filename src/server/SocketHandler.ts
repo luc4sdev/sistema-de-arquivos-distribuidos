@@ -41,6 +41,30 @@ export class SocketHandler {
                 callback({ status: 'success', timeMs });
             });
 
+            socket.on('list', async (payload, callback) => {
+                const { result, timeMs } = await measureTime(() => this.fileServer.listFiles(payload));
+                this.performanceMetrics.push({ operation: `list_${payload.path || 'root'}`, timeMs });
+                callback({ ...result, timeMs });
+            });
+
+            socket.on('copy', async (payload, callback) => {
+                const { timeMs } = await measureTime(() => this.fileServer.copyFile(payload));
+                this.performanceMetrics.push({
+                    operation: `copy_${payload.source}_to_${payload.destination}`,
+                    timeMs
+                });
+                callback({ status: 'success', timeMs });
+            });
+
+            socket.on('download', async (payload, callback) => {
+                const { result, timeMs } = await measureTime(() => this.fileServer.downloadFile(payload));
+                this.performanceMetrics.push({
+                    operation: `download_${payload.path}`,
+                    timeMs
+                });
+                callback({ ...result, timeMs });
+            });
+
             socket.on('disconnect', async () => {
                 console.log('Cliente desconectado:', socket.id);
                 if (this.performanceMetrics.length > 0) {

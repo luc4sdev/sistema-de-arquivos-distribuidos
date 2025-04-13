@@ -15,7 +15,15 @@ export class Cli {
 
     public async start() {
         console.log('Sistemas de Arquivos Distribuídos - Cliente');
-        console.log('Comandos disponíveis: create, read, write, delete, exit');
+        console.log('Comandos disponíveis:');
+        console.log('  create <nome> <conteúdo> - Cria um arquivo');
+        console.log('  read <nome>              - Lê um arquivo');
+        console.log('  write <nome> <conteúdo>  - Atualiza um arquivo');
+        console.log('  delete <nome>            - Remove um arquivo');
+        console.log('  list [path]              - Lista arquivos');
+        console.log('  copy <origem> <destino>  - Copia um arquivo');
+        console.log('  download <remoto> [local]- Baixa um arquivo');
+        console.log('  exit                     - Sai do programa');
 
         this.fileClient.onConnect(() => {
             this.showPrompt();
@@ -45,6 +53,15 @@ export class Cli {
                         break;
                     case 'delete':
                         await this.handleDelete(args);
+                        break;
+                    case 'list':
+                        await this.handleList(args);
+                        break;
+                    case 'copy':
+                        await this.handleCopy(args);
+                        break;
+                    case 'download':
+                        await this.handleDownload(args);
                         break;
                     case 'exit':
                         this.rl.close();
@@ -94,5 +111,27 @@ export class Cli {
             return;
         }
         await this.fileClient.deleteFile(args[0]);
+    }
+
+    private async handleList(args: string[]) {
+        const path = args.length > 0 ? args[0] : '';
+        await this.fileClient.listFiles(path);
+    }
+
+    private async handleCopy(args: string[]) {
+        if (args.length < 2) {
+            console.log('Uso: copy <origem> <destino>');
+            return;
+        }
+        await this.fileClient.copyFile(args[0], args[1]);
+    }
+
+    private async handleDownload(args: string[]) {
+        if (args.length < 1) {
+            console.log('Uso: download <arquivo_remoto> [arquivo_local]');
+            return;
+        }
+        const outputPath = args.length > 1 ? args[1] : undefined;
+        await this.fileClient.downloadFile(args[0], outputPath);
     }
 }

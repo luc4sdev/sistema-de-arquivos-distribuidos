@@ -60,12 +60,60 @@ export class FileClient {
         });
     }
 
+    public async listFiles(path: string = ''): Promise<FileOperationResponse> {
+        return new Promise((resolve) => {
+            this.socketClient.listFiles(
+                { path },
+                (response) => {
+                    console.log('Listar arquivos:', response, `Tempo: ${response.timeMs}ms`);
+                    if (response.files) {
+                        console.log('Arquivos:');
+                        response.files.forEach(file => {
+                            console.log(`- ${file.name}${file.isDirectory ? '/' : ''}`);
+                        });
+                    }
+                    resolve(response);
+                }
+            );
+        });
+    }
+
+    public async copyFile(source: string, destination: string): Promise<FileOperationResponse> {
+        return new Promise((resolve) => {
+            this.socketClient.copyFile(
+                { source, destination },
+                (response) => {
+                    console.log('Copiar arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                    resolve(response);
+                }
+            );
+        });
+    }
+
+    public async downloadFile(path: string, outputName?: string): Promise<FileOperationResponse> {
+        return new Promise((resolve) => {
+            this.socketClient.downloadFile(
+                { path, outputName },
+                (response) => {
+                    console.log('Download arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                    if (response.content && response.filename) {
+                        console.log(`Arquivo ${response.filename} baixado com sucesso!`);
+                    }
+                    resolve(response);
+                }
+            );
+        });
+    }
+
     public async runExampleOperations(): Promise<void> {
         this.socketClient.onConnect(async () => {
             await this.createFile('teste.txt', 'Hello World\n');
+            await this.listFiles();
             await this.readFile('teste.txt');
+            await this.copyFile('teste.txt', 'copia_teste.txt');
             await this.writeFile('teste.txt', 'Mais texto\n');
             await this.readFile('teste.txt');
+            await this.downloadFile('teste.txt');
             //await this.deleteFile('teste.txt');
         });
     }

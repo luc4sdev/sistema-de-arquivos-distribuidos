@@ -3,6 +3,25 @@ export interface FileOperationResponse {
     message?: string;
     content?: string;
     timeMs?: number;
+    files?: Array<{
+        name: string;
+        isDirectory: boolean;
+    }>;
+    filename?: string;
+}
+
+export interface ListFilesPayload {
+    path?: string;  // Caminho relativo ao diretório base
+}
+
+export interface CopyFilePayload {
+    source: string; // Caminho relativo do arquivo de origem
+    destination: string; // Caminho relativo do arquivo de destino
+}
+
+export interface DownloadFilePayload {
+    path: string;   // Caminho relativo do arquivo a ser baixado
+    outputName?: string; // Nome opcional para o arquivo de saída
 }
 
 export interface CreateFilePayload {
