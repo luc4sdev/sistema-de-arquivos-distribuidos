@@ -3,6 +3,7 @@
 O projeto consiste em um Sistema de Arquivos Distribuídos utilizando WebSockets, foi desenvolvido o servidor e o cliente o qual pode ser acessado através de uma CLI.
 O projeto foi desenvolvido em NodeJS e Typescript, juntamente com a biblioteca Socket.io.
 É possível (Criar, Buscar, Atualizar, Ler, Copiar, Baixar e Deletar) arquivos.
+Também foi implementada métricas para cada método e ao final da conexão do cliente é criado um gráfico representando cada operação e seu tempo em ms
 
 <br/>
 
