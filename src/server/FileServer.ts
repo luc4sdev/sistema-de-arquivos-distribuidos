@@ -44,9 +44,11 @@ export class FileServer {
 
     async copyFile({ source, destination }: CopyFilePayload): Promise<FileOperationResponse> {
         try {
-            const safeSource = this.getSafePath(source);
-            const safeDestination = this.getSafePath(destination);
+            const localDir = path.resolve(__dirname, '../../localFiles');
+            const remoteDir = path.resolve(__dirname, '../../files');
 
+            const safeSource = path.resolve(localDir, source);
+            const safeDestination = path.resolve(remoteDir, destination);
             await fs.copyFile(safeSource, safeDestination);
             return { status: 'success' };
         } catch (err) {
@@ -70,15 +72,8 @@ export class FileServer {
     }
 
 
-    private getSafePath(userPath: string): string {
-        const normalizedPath = path.normalize(userPath);
-        const fullPath = path.join(FILES_DIR, normalizedPath);
-
-        if (!fullPath.startsWith(FILES_DIR)) {
-            throw new Error('Acesso ao caminho negado');
-        }
-
-        return fullPath;
+    private getSafePath(filePath: string): string {
+        return path.resolve(FILES_DIR, filePath);
     }
 
     private async isDirectory(path: string): Promise<boolean> {

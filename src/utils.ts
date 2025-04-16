@@ -39,8 +39,7 @@ export async function generateChart(metrics: PerformanceMetrics[]): Promise<void
     };
 
     const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
-    const now = new Date().getTime()
-    await fs.writeFile(path.join(__dirname, `../charts/performance_${now}.png`), imageBuffer);
+    await fs.writeFile(path.join(__dirname, `../charts/performance.png`), imageBuffer);
 }
 
 export async function measureTime<T>(fn: () => Promise<T>): Promise<{ result: T; timeMs: number }> {

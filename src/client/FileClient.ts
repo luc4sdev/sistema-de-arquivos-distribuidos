@@ -1,5 +1,7 @@
 import { SocketClient } from './SocketClient';
 import { FileOperationResponse } from '../types';
+import * as fs from 'fs';
+import * as pathFile from 'path';
 
 export class FileClient {
     private socketClient: SocketClient;
@@ -97,6 +99,14 @@ export class FileClient {
                 (response) => {
                     console.log('Download arquivo:', response, `Tempo: ${response.timeMs}ms`);
                     if (response.content && response.filename) {
+                        const decodedContent = Buffer.from(response.content, 'base64');
+                        const outputDir = pathFile.resolve(__dirname, '../../', 'localFiles');
+                        if (!fs.existsSync(outputDir)) {
+                            fs.mkdirSync(outputDir, { recursive: true });
+                        }
+                        const localPath = pathFile.join(outputDir, outputName || response.filename);
+                        fs.writeFileSync(localPath, decodedContent);
+
                         console.log(`Arquivo ${response.filename} baixado com sucesso!`);
                     }
                     resolve(response);
