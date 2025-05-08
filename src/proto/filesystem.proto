@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package filesystem;
+
+service FileSystem {
+  // Operações básicas
+  rpc CreateFile (CreateFileRequest) returns (FileOperationResponse) {}
+  rpc ReadFile (ReadFileRequest) returns (ReadFileResponse) {}
+  rpc WriteFile (WriteFileRequest) returns (FileOperationResponse) {}
+  rpc DeleteFile (DeleteFileRequest) returns (FileOperationResponse) {}
+  
+  // Operações avançadas
+  rpc ListFiles (ListFilesRequest) returns (ListFilesResponse) {}
+  rpc CopyFile (CopyFileRequest) returns (FileOperationResponse) {}
+  rpc DownloadFile (DownloadFileRequest) returns (DownloadFileResponse) {}
+}
+
+// Mensagens de requisição
+message CreateFileRequest {
+  string filename = 1;
+  string content = 2;
+}
+
+message ReadFileRequest {
+  string filename = 1;
+}
+
+message WriteFileRequest {
+  string filename = 1;
+  string content = 2;
+}
+
+message DeleteFileRequest {
+  string filename = 1;
+}
+
+message ListFilesRequest {
+  string path = 1;
+}
+
+message CopyFileRequest {
+  string source = 1;
+  string destination = 2;
+}
+
+message DownloadFileRequest {
+  string path = 1;
+  string output_name = 2;
+}
+
+// Mensagens de resposta
+message FileOperationResponse {
+  string status = 1;
+  string message = 2;
+  int64 time_ms = 3;
+}
+
+message ReadFileResponse {
+  string status = 1;
+  string message = 2;
+  string content = 3;
+  int64 time_ms = 4;
+}
+
+message ListFilesResponse {
+  string status = 1;
+  string message = 2;
+  repeated FileInfo files = 3;
+  int64 time_ms = 4;
+}
+
+message FileInfo {
+  string name = 1;
+  bool is_directory = 2;
+}
+
+message DownloadFileResponse {
+  string status = 1;
+  string message = 2;
+  string filename = 3;
+  string content = 4; // Base64 encoded
+  int64 time_ms = 5;
+}

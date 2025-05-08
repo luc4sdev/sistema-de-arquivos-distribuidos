@@ -1,4 +1,4 @@
-import { Server } from './server/Server';
+import { GRPCServer } from './server/Server';
 
-const server = new Server();
-server.start(3000);
+const server = new GRPCServer();
+server.start(50051);

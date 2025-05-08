@@ -1,136 +1,129 @@
-import express, { Express, Request, Response, NextFunction } from 'express';
-import { createServer, Server as HttpServer } from 'http';
-import { Server as SocketServer } from 'socket.io';
-import { FileServer } from './FileServer';
-import { SocketHandler } from './SocketHandler';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import path from 'path';
-import fs from 'fs/promises';
+import { FileServer } from './FileServer';
+import { measureTime } from '../utils';
+import { PerformanceMetrics } from '../types';
+import { generateChart } from '../utils';
 
-export class Server {
-    private app: Express;
-    private httpServer: HttpServer;
-    private io: SocketServer;
+const PROTO_PATH = path.join(__dirname, '../proto/filesystem.proto');
+
+export class GRPCServer {
+    private server: grpc.Server;
     private fileServer: FileServer;
+    private performanceMetrics: PerformanceMetrics[] = [];
 
     constructor() {
-        this.app = express();
-        this.httpServer = createServer(this.app);
-        this.io = new SocketServer(this.httpServer);
         this.fileServer = new FileServer();
-        this.setupMiddleware();
-        this.setupRoutes();
-        new SocketHandler(this.io);
+        this.server = new grpc.Server();
+        this.setupGRPC();
     }
 
-    private setupMiddleware() {
-        this.app.use(express.json());
+    private setupGRPC() {
+        const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
+            keepCase: true,
+            longs: String,
+            enums: String,
+            defaults: true,
+            oneofs: true
+        });
+
+
+        const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as any;
+
+        this.server.addService(protoDescriptor.filesystem.FileSystem.service, {
+            CreateFile: this.wrapWithMetrics(this.createFile.bind(this), 'create'),
+            ReadFile: this.wrapWithMetrics(this.readFile.bind(this), 'read'),
+            WriteFile: this.wrapWithMetrics(this.writeFile.bind(this), 'write'),
+            DeleteFile: this.wrapWithMetrics(this.deleteFile.bind(this), 'delete'),
+            ListFiles: this.wrapWithMetrics(this.listFiles.bind(this), 'list'),
+            CopyFile: this.wrapWithMetrics(this.copyFile.bind(this), 'copy'),
+            DownloadFile: this.wrapWithMetrics(this.downloadFile.bind(this), 'download')
+        });
     }
 
-    private setupRoutes() {
-        // Listar arquivos
-        this.app.get('/files', async (req: Request, res: Response) => {
-            try {
-                const { path: dirPath = '' } = req.query;
-                const result = await this.fileServer.listFiles({ path: dirPath as string });
-                if (result.status === 'error') {
-                    res.status(400).json(result);
-                    return
-                }
-                res.json(result);
-            } catch (err) {
-                res.status(500).json({
-                    status: 'error',
-                    message: (err as Error).message
-                });
-            }
+    private wrapWithMetrics(
+        fn: (call: any, callback: any) => Promise<any>,
+        operationPrefix: string
+    ) {
+        return async (call: any, callback: any) => {
+            const { timeMs, result } = await measureTime(() => fn(call, callback));
+
+            const operation = `${operationPrefix}_${call.request.filename || call.request.path || 'root'}`;
+            this.performanceMetrics.push({ operation, timeMs });
+
+            callback(null, { ...result, timeMs });
+        };
+    }
+
+    private async createFile(call: any): Promise<any> {
+        const { filename, content } = call.request;
+        const result = await this.fileServer.createFile({ filename, content });
+        return result;
+    }
+
+    private async readFile(call: any): Promise<any> {
+        const { filename } = call.request;
+        const result = await this.fileServer.readFile({ filename });
+        return result;
+    }
+
+    private async writeFile(call: any): Promise<any> {
+        const { filename, content } = call.request;
+        const result = await this.fileServer.writeFile({ filename, content });
+        return result;
+    }
+
+    private async deleteFile(call: any): Promise<any> {
+        const { filename } = call.request;
+        const result = await this.fileServer.deleteFile({ filename });
+        return result;
+    }
+
+    private async listFiles(call: any): Promise<any> {
+        const { path } = call.request;
+        const result = await this.fileServer.listFiles({ path });
+        return result;
+    }
+
+    private async copyFile(call: any): Promise<any> {
+        const { source, destination } = call.request;
+        const result = await this.fileServer.copyFile({ source, destination });
+        return result;
+    }
+
+    private async downloadFile(call: any): Promise<any> {
+        const { path, output_name } = call.request;
+        const result = await this.fileServer.downloadFile({
+            path,
+            outputName: output_name
         });
+        return result;
+    }
 
-
-        // Download de arquivo
-        this.app.get('/files/download', async (req: Request, res: Response) => {
-            try {
-                const { path: filePath, name: outputName } = req.query;
-
-                if (!filePath) {
-                    res.status(400).json({
-                        status: 'error',
-                        message: 'O parâmetro "path" é obrigatório'
-                    });
-                    return
-                }
-
-                const result = await this.fileServer.downloadFile({
-                    path: filePath as string,
-                    outputName: outputName as string | undefined
-                });
-
-                if (result.status === 'error') {
-                    res.status(400).json(result);
-                    return
-                }
-
-                if (result.filename && result.content) {
-                    const buffer = Buffer.from(result.content, 'base64');
-                    res.setHeader('Content-Disposition', `attachment; filename=${result.filename}`);
-                    res.setHeader('Content-Type', 'application/octet-stream');
-                    res.send(buffer);
-                    return
-                }
-
-                res.json(result);
-            } catch (err) {
-                res.status(500).json({
-                    status: 'error',
-                    message: (err as Error).message
-                });
-            }
-        });
-
-        // Copiar arquivo
-        this.app.post('/files/copy', async (req: Request, res: Response) => {
-            try {
-                const { source, destination } = req.body;
-
-                if (!source || !destination) {
-                    res.status(400).json({
-                        status: 'error',
-                        message: 'Os parâmetros "source" e "destination" são obrigatórios'
-                    });
-                    return
-                }
-
-                const result = await this.fileServer.copyFile({ source, destination });
-                res.json(result);
-            } catch (err) {
-                res.status(500).json({
-                    status: 'error',
-                    message: (err as Error).message
-                });
-            }
-        });
-
-        // Rota para arquivos estáticos
-        this.app.get('/files/static/:filename', async (req: Request, res: Response) => {
-            try {
-                const { filename } = req.params;
-                const filePath = path.join(__dirname, '../../files', filename);
-
-                await fs.access(filePath); // Verifica se o arquivo existe
-                res.sendFile(filePath);
-            } catch (err) {
-                res.status(500).json({
-                    status: 'error',
-                    message: (err as Error).message
-                });
-            }
-        });
+    public async generatePerformanceChart() {
+        if (this.performanceMetrics.length > 0) {
+            await generateChart(this.performanceMetrics);
+            console.log('Gráfico de desempenho gerado com sucesso!');
+            this.performanceMetrics = [];
+        }
     }
 
     public start(port: number) {
-        this.httpServer.listen(port, () => {
-            console.log(`Servidor rodando na porta ${port}`);
-            console.log(`WebSocket disponível em ws://localhost:${port}`);
-            console.log(`API REST disponível em http://localhost:${port}/files`);
-        });
+        this.server.bindAsync(
+            `0.0.0.0:${port}`,
+            grpc.ServerCredentials.createInsecure(),
+            (err, port) => {
+                if (err) {
+                    console.error('Erro ao iniciar servidor gRPC:', err);
+                    return;
+                }
+                console.log(`Servidor gRPC rodando na porta ${port}`);
+                this.server.start();
+            }
+        );
+
+        // Gerar gráfico periodicamente (opcional)
+        setInterval(() => this.generatePerformanceChart(), 30000);
     }
 }
