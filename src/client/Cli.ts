@@ -6,7 +6,7 @@ export class Cli {
     private rl: readline.Interface;
 
     constructor() {
-        this.fileClient = new FileClient('172.16.5.188:50051');
+        this.fileClient = new FileClient('localhost:50051');
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
