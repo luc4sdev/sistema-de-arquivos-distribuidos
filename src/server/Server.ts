@@ -5,6 +5,7 @@ import { FileServer } from './FileServer';
 import { measureTime } from '../utils';
 import { PerformanceMetrics } from '../types';
 import { generateChart } from '../utils';
+import { RedisPubSub } from '../redis/RedisPubSub';
 
 const PROTO_PATH = path.join(__dirname, '../proto/filesystem.proto');
 
@@ -12,11 +13,13 @@ export class GRPCServer {
     private server: grpc.Server;
     private fileServer: FileServer;
     private performanceMetrics: PerformanceMetrics[] = [];
+    private pubSub: RedisPubSub;
 
     constructor() {
         this.fileServer = new FileServer();
         this.server = new grpc.Server();
         this.setupGRPC();
+        this.pubSub = new RedisPubSub();
     }
 
     private setupGRPC() {
@@ -59,6 +62,12 @@ export class GRPCServer {
     private async createFile(call: any): Promise<any> {
         const { filename, content } = call.request;
         const result = await this.fileServer.createFile({ filename, content });
+        await this.pubSub.publishToPath('file_events', {
+            event_type: 'CREATE',
+            file_path: filename,
+            timestamp: Date.now(),
+            additional_info: ''
+        });
         return result;
     }
 
@@ -71,12 +80,24 @@ export class GRPCServer {
     private async writeFile(call: any): Promise<any> {
         const { filename, content } = call.request;
         const result = await this.fileServer.writeFile({ filename, content });
+        await this.pubSub.publishToPath('file_events', {
+            event_type: 'MODIFY',
+            file_path: filename,
+            timestamp: Date.now(),
+            additional_info: ''
+        });
         return result;
     }
 
     private async deleteFile(call: any): Promise<any> {
         const { filename } = call.request;
         const result = await this.fileServer.deleteFile({ filename });
+        await this.pubSub.publishToPath('file_events', {
+            event_type: 'DELETE',
+            file_path: filename,
+            timestamp: Date.now(),
+            additional_info: ''
+        });
         return result;
     }
 

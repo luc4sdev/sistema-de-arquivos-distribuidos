@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: redis_container
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --timeout 300
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis_setup:
+    image: redis:latest
+    container_name: redis_setup
+    depends_on:
+      redis:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Waiting for Redis to be ready..."
+        until redis-cli -h redis_container ping | grep -q PONG; do
+          sleep 1
+        done
+        echo "Redis is up. Running commands."
+        redis-cli -h redis_container <<EOF
+          CONFIG SET maxmemory 2gb
+          CONFIG SET maxmemory-policy allkeys-lru
+          INFO
+        EOF
+        echo "Commands executed. Exiting."
+
+volumes:
+  redis_data:
+    driver: local

@@ -46,3 +46,23 @@ export interface PerformanceMetrics {
     operation: string;
     timeMs: number;
 }
+
+export type EventType = 'CREATE' | 'DELETE' | 'MODIFY' | 'RENAME' | 'MOVE';
+
+export interface Notification {
+    event_type: EventType;
+    file_path: string;
+    timestamp: number;
+    additional_info?: string;
+    file_size?: number;
+    user_id?: string;
+    original_path?: string;
+}
+
+export interface SubscriptionRequest {
+    client_id: string;
+    watch_paths: string[];
+    recursive?: boolean;
+    event_types?: EventType[];
+}
+
