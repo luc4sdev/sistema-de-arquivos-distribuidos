@@ -90,7 +90,7 @@ message SubscriptionRequest {
 }
 
 message Notification {
-  string event_type = 1;  // CREATE, DELETE, MODIFY, RENAME
+  string event_type = 1;  // CREATE, DELETE, UPDATE, RENAME
   string file_path = 2;
   int64 timestamp = 3;
   string additional_info = 4;

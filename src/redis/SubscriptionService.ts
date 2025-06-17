@@ -5,8 +5,8 @@ import { Notification, SubscriptionRequest } from '../types';
 export class SubscriptionService {
     private pubSub: RedisPubSub;
 
-    constructor() {
-        this.pubSub = new RedisPubSub();
+    constructor(pubSub: RedisPubSub) {
+        this.pubSub = pubSub;
     }
 
     public async subscribe(call: grpc.ServerWritableStream<SubscriptionRequest, Notification>) {

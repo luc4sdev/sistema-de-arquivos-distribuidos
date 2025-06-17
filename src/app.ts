@@ -1,4 +1,4 @@
 import { GRPCServer } from './server/Server';
 
 const server = new GRPCServer();
-server.start(50051);
+server.start();

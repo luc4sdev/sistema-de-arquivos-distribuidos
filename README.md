@@ -45,6 +45,14 @@ npm:
 ```
 npm run dev
 npm run dev:server
+# Terminal 1 (Nó Primário - Porta 50051)
+$env:NODE_ID="node1"; $env:PORT="50051"; $env:STORAGE_PATH="./nodes"; npm run dev:server
+
+# Terminal 2 (Réplica 1 - Porta 50052)
+$env:NODE_ID="node2"; $env:PORT="50052"; $env:STORAGE_PATH="./nodes"; npm run dev:server
+
+# Terminal 3 (Réplica 2 - Porta 50053)
+$env:NODE_ID="node3"; $env:PORT="50053"; $env:STORAGE_PATH="./nodes"; npm run dev:server
 ```
 yarn:
 ```
