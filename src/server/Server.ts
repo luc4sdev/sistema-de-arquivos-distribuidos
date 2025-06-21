@@ -26,7 +26,8 @@ export class GRPCServer {
         private storagePath: string = process.env.STORAGE_PATH || './nodes'
     ) {
         this.pubSub = new RedisPubSub();
-        this.metadataService = new MetadataService();
+        const redisClient = this.pubSub.getClient();
+        this.metadataService = new MetadataService(redisClient);
         this.replicationService = new ReplicationService(
             this.metadataService,
             this.pubSub,
@@ -81,7 +82,6 @@ export class GRPCServer {
         try {
             // Registrar arquivo nos metadados
             const replicaNodes = this.metadataService.findNewReplicaCandidates([this.nodeId]);
-            console.log(replicaNodes)
             this.metadataService.registerFile(filename, this.nodeId, replicaNodes);
 
             // Processar com replicação

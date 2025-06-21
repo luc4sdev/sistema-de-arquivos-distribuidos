@@ -30,6 +30,46 @@ export class FileServer {
         return path.join(this.storageBasePath, nodeId, filePath);
     }
 
+    async createFile({ filename, content }: CreateFilePayload): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            await fs.mkdir(path.dirname(fullPath), { recursive: true });
+            await fs.writeFile(fullPath, content);
+            return { status: 'success' };
+        } catch (err) {
+            return {
+                status: 'error',
+                message: `Erro ao criar arquivo: ${(err as Error).message}`
+            };
+        }
+    }
+
+    async writeFile({ filename, content }: WriteFilePayload): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            await fs.writeFile(fullPath, content);
+            return { status: 'success' };
+        } catch (err) {
+            return {
+                status: 'error',
+                message: `Erro ao escrever no arquivo: ${(err as Error).message}`
+            };
+        }
+    }
+
+    async deleteFile({ filename }: DeleteFilePayload): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            await fs.unlink(fullPath);
+            return { status: 'success' };
+        } catch (err) {
+            return {
+                status: 'error',
+                message: `Erro ao deletar arquivo: ${(err as Error).message}`
+            };
+        }
+    }
+
     async listFiles({ path: filePath = '', nodeId }: ListFilesPayload & { nodeId?: string }): Promise<FileOperationResponse> {
         try {
             const targetNode = nodeId || this.replicationService.currentNodeId;
@@ -145,11 +185,13 @@ export class FileServer {
             }
 
             // Se falhar, tenta nas réplicas
+            let successfulNode: string | null = null;
             if (!content) {
                 for (const node of replicaNodes) {
                     try {
                         const nodePath = this.getNodePath(node, filename);
                         content = await fs.readFile(nodePath, 'utf-8');
+                        successfulNode = node;
                         if (content) break;
                     } catch (err) {
                         lastError = err as Error;
@@ -165,7 +207,7 @@ export class FileServer {
             return {
                 status: 'success',
                 content,
-                node: content ? preferredNode : undefined
+                node: successfulNode || preferredNode
             };
         } catch (err) {
             return {
@@ -213,59 +255,6 @@ export class FileServer {
             return stat.isDirectory();
         } catch {
             return false;
-        }
-    }
-
-    async createFile({ filename, content }: CreateFilePayload): Promise<FileOperationResponse> {
-        try {
-            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            await fs.mkdir(path.dirname(fullPath), { recursive: true });
-            await fs.writeFile(fullPath, content);
-            return { status: 'success' };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao criar arquivo: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async readFile({ filename }: ReadFilePayload): Promise<FileOperationResponse> {
-        try {
-            const localPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            const content = await fs.readFile(localPath, 'utf-8');
-            return { status: 'success', content };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao ler arquivo: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async writeFile({ filename, content }: WriteFilePayload): Promise<FileOperationResponse> {
-        try {
-            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            await fs.writeFile(fullPath, content);
-            return { status: 'success' };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao escrever no arquivo: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async deleteFile({ filename }: DeleteFilePayload): Promise<FileOperationResponse> {
-        try {
-            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            await fs.unlink(fullPath);
-            return { status: 'success' };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao deletar arquivo: ${(err as Error).message}`
-            };
         }
     }
 }

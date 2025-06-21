@@ -1,18 +1,20 @@
 import { RedisPubSub } from '../redis/RedisPubSub';
 import { MetadataService } from './metadataService';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
-import path, { join } from 'path';
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
 import { Notification } from '../types';
 import * as crypto from 'crypto';
+import { FileServer } from './FileServer';
 
-const INTEGRITY_CHECK_INTERVAL = 30000;
-const HEARTBEAT_INTERVAL = 5000;
+const INTEGRITY_CHECK_INTERVAL = 30000; // 30 seconds
+const HEARTBEAT_INTERVAL = 5000; // 5 seconds
 const REPLICATION_TIMEOUT = 10000; // 10 seconds
 
 export class ReplicationService {
   private healthyNodes: Set<string> = new Set();
   public currentNodeId: string;
   private storagePath: string;
+  private fileServer: FileServer;
 
   constructor(
     private metadataService: MetadataService,
@@ -25,6 +27,7 @@ export class ReplicationService {
     this.setupSubscriptions();
     this.startHeartbeat();
     this.startIntegrityChecks();
+    this.fileServer = new FileServer(this.metadataService, this, this.storagePath);
   }
 
   public async initialize() {
@@ -35,6 +38,25 @@ export class ReplicationService {
       storageCapacity: this.getStorageCapacity(),
       storageUsed: this.getStorageUsed()
     });
+
+    await this.metadataService.loadAllMetadataFromRedis();
+    // Inicializa healthyNodes com base nos nós já conhecidos com status ONLINE
+    const allNodes = this.metadataService.getAllNodes();
+    for (const nodeId of Object.keys(allNodes)) {
+      const node = allNodes[nodeId];
+      if (node.status === 'ONLINE') {
+        this.healthyNodes.add(nodeId);
+      }
+    }
+    console.log('[INIT] healthyNodes inicializados:', Array.from(this.healthyNodes));
+
+    this.pubSub.publish('node_sync', {
+      event_type: 'NODE_JOIN',
+      file_path: '',
+      timestamp: Date.now(),
+      additional_info: JSON.stringify({ nodeId: this.currentNodeId })
+    });
+
   }
 
   private setupSubscriptions() {
@@ -57,6 +79,18 @@ export class ReplicationService {
       }
     });
 
+    this.pubSub.subscribe('node_sync', async (msg: Notification) => {
+      if (msg.event_type === 'NODE_JOIN') {
+        const { nodeId } = JSON.parse(msg.additional_info || '{}');
+        if (nodeId === this.currentNodeId) return;
+
+        this.healthyNodes.add(nodeId);
+        console.log(`[NODE_JOIN] ${nodeId} adicionado a healthyNodes em ${this.currentNodeId}`);
+
+        await this.syncFilesToNewNode(nodeId);
+      }
+    });
+
   }
 
   private startHeartbeat() {
@@ -74,6 +108,7 @@ export class ReplicationService {
         timestamp: Date.now(),
         additional_info: JSON.stringify(status)
       });
+      console.log('[HEARTBEAT] Enviado de', this.currentNodeId)
     }, HEARTBEAT_INTERVAL);
   }
 
@@ -119,6 +154,101 @@ export class ReplicationService {
     }
   }
 
+  private async syncFilesToNewNode(newNodeId: string) {
+    const allFiles = this.metadataService.getAllFiles();
+    console.log('[SYNC] Iniciando sincronização para', newNodeId, 'arquivos:', allFiles);
+
+    for (const filename of allFiles) {
+      const metadata = this.metadataService.getFileMetadata(filename);
+      if (!metadata) continue;
+
+
+      const localFilePath = join(this.storagePath, newNodeId, filename);
+      const fileExistsLocally = existsSync(localFilePath);
+
+      if (fileExistsLocally && !metadata.replicaNodes.includes(newNodeId)) {
+        console.warn(`[SYNC] Arquivo ${filename} existe localmente no ${newNodeId} mas não está nos metadados. Resolvendo conflito...`);
+
+        // Opção 2: Adicionar o nó como réplica (mais arriscada)
+        metadata.replicaNodes.push(newNodeId);
+        this.metadataService.updateFileMetadata(filename, {
+          replicaNodes: metadata.replicaNodes
+        });
+        console.log(`[SYNC] Adicionado ${newNodeId} como réplica para ${filename} devido a arquivo local existente`);
+        continue;
+      }
+
+      // Se o nó já é uma réplica listada nos metadados, verificar integridade
+      if (metadata.replicaNodes.includes(newNodeId)) {
+        console.log(`[SYNC] ${filename} já está listado como presente no ${newNodeId}, verificando integridade...`);
+
+        try {
+          const localChecksum = fileExistsLocally ? this.calculateChecksum(localFilePath) : '';
+          const expectedChecksum = metadata.checksum;
+
+          if (localChecksum !== expectedChecksum) {
+            console.log(`[SYNC] Checksum divergente para ${filename} no ${newNodeId} (local: ${localChecksum}, esperado: ${expectedChecksum}), replicando...`);
+            // Força a replicação mesmo sendo listado nos metadados
+          } else {
+            console.log(`[SYNC] ${filename} já está sincronizado no ${newNodeId}`);
+            continue;
+          }
+        } catch (err) {
+          console.error(`[SYNC] Erro ao verificar checksum de ${filename} no ${newNodeId}:`, err);
+        }
+      }
+
+      let content: string | null = null;
+      try {
+        const result = await this.fileServer.readFileWithFallback({
+          filename,
+          preferredNode: metadata.primaryNode,
+          replicaNodes: metadata.replicaNodes
+        });
+        content = result.content || null;
+      } catch (err) {
+        console.error(`[SYNC] Falha ao ler arquivo ${filename} para replicar ao novo nó:`, err);
+        continue;
+      }
+
+      if (!content) {
+        console.warn(`[SYNC] Arquivo ${filename} não encontrado no nó primário nem nas réplicas.`);
+        continue;
+      }
+
+      // Verifica se o novo nó está saudável antes de enviar
+      if (!this.healthyNodes.has(newNodeId)) {
+        console.warn(`[SYNC] Nó ${newNodeId} não está saudável, pulando sincronização de ${filename}`);
+        continue;
+      }
+
+      console.log(`[SYNC] Enviando ${filename} (${content.length} bytes) para ${newNodeId}`);
+
+      try {
+        // Envia arquivo para o nó novo
+        await this.sendToReplicas(
+          filename,
+          'CREATE',
+          content,
+          metadata.version,
+          this.calculateChecksumFromString(content),
+          [newNodeId] // Envia apenas para o novo nó
+        );
+
+        // Atualiza metadados: adiciona o novo nó como réplica
+        const newReplicaNodes = Array.from(new Set([...metadata.replicaNodes, newNodeId]));
+        await this.metadataService.updateFileMetadata(filename, {
+          replicaNodes: newReplicaNodes,
+          lastUpdated: new Date()
+        });
+
+        console.log(`[SYNC] Arquivo ${filename} sincronizado para o novo nó ${newNodeId}`);
+      } catch (err) {
+        console.error(`[SYNC] Falha ao sincronizar ${filename} para ${newNodeId}:`, err);
+      }
+    }
+  }
+
   public async replicateFileOperation(
     filePath: string,
     operation: 'CREATE' | 'UPDATE' | 'DELETE',
@@ -155,18 +285,24 @@ export class ReplicationService {
     operation: 'CREATE' | 'UPDATE' | 'DELETE',
     content?: string
   ) {
-    const fullPath = this.getFilePath(filePath);
-
     try {
       switch (operation) {
         case 'CREATE':
+          await this.fileServer.createFile({
+            filename: filePath,
+            content: content || ''
+          });
+          break;
         case 'UPDATE':
-          if (!content) throw new Error('Conteúdo necessário');
-          mkdirSync(path.dirname(fullPath), { recursive: true });
-          writeFileSync(fullPath, content);
+          this.fileServer.writeFile({
+            filename: filePath,
+            content: content || ''
+          });
           break;
         case 'DELETE':
-          if (existsSync(fullPath)) unlinkSync(fullPath);
+          await this.fileServer.deleteFile({
+            filename: filePath
+          });
           break;
       }
     } catch (err) {
@@ -180,15 +316,17 @@ export class ReplicationService {
     operation: 'CREATE' | 'UPDATE' | 'DELETE',
     content: string,
     version: number,
-    checksum: string
+    checksum: string,
+    targetNodesOverride?: string[]
   ) {
     const metadata = this.metadataService.getFileMetadata(filePath);
     if (!metadata) return;
 
-    const healthyReplicas = metadata.replicaNodes.filter(node =>
+    const targets = targetNodesOverride ?? metadata.replicaNodes;
+    const healthyReplicas = targets.filter(node =>
       this.healthyNodes.has(node) && node !== this.currentNodeId
     );
-
+    console.log(targets, healthyReplicas)
     if (healthyReplicas.length === 0) {
       console.warn(`Nenhuma réplica saudável disponível para ${filePath}`);
       return;

@@ -68,4 +68,8 @@ export class RedisPubSub {
 
         return paths;
     }
+
+    public getClient(): RedisClientType {
+        return this.publisher;
+    }
 }

@@ -43,8 +43,8 @@ Para rodar o projeto digite no terminal:
 
 npm:
 ```
+docker compose up -d
 npm run dev
-npm run dev:server
 # Terminal 1 (Nó Primário - Porta 50051)
 $env:NODE_ID="node1"; $env:PORT="50051"; $env:STORAGE_PATH="./nodes"; npm run dev:server
 
