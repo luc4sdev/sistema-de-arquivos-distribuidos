@@ -1,19 +1,16 @@
 import { FileClient } from './FileClient';
 import * as readline from 'readline';
-import { Notification } from '../types'
 
 export class Cli {
     private fileClient: FileClient;
     private rl: readline.Interface;
-    private isSubscribed: boolean;
 
     constructor() {
-        this.fileClient = new FileClient('localhost:50051');
+        this.fileClient = new FileClient('localhost:50050');
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
         });
-        this.isSubscribed = false;
     }
 
     public async start() {
@@ -26,8 +23,6 @@ export class Cli {
         console.log('  list [path]              - Lista arquivos');
         console.log('  copy <origem> <destino>  - Copia um arquivo');
         console.log('  download <remoto> [local]- Baixa um arquivo');
-        console.log('  subscribe <path1,path2>  - Assina notificações');
-        console.log('  unsubscribe              - Cancela assinaturas');
         console.log('  exit                     - Sai do programa');
 
         this.fileClient.onConnect(() => {
@@ -36,7 +31,6 @@ export class Cli {
 
         this.rl.on('close', () => {
             console.log('Desconectando...');
-            this.fileClient.disconnect();
             process.exit(0);
         });
     }
@@ -67,12 +61,6 @@ export class Cli {
                         break;
                     case 'download':
                         await this.handleDownload(args);
-                        break;
-                    case 'subscribe':
-                        await this.handleSubscribe(args);
-                        break;
-                    case 'unsubscribe':
-                        await this.handleUnsubscribe();
                         break;
                     case 'exit':
                         this.rl.close();
@@ -144,31 +132,5 @@ export class Cli {
         }
         const outputPath = args.length > 1 ? args[1] : undefined;
         await this.fileClient.downloadFile(args[0], outputPath);
-    }
-
-    private async handleSubscribe(args: string[]) {
-        if (args.length < 1) {
-            console.log('Uso: subscribe <caminho1,caminho2>');
-            return;
-        }
-
-        const paths = args[0].split(',');
-
-        await this.fileClient.subscribe(paths, (notification) => {
-            console.log('\n=== NOTIFICAÇÃO ===');
-            console.log('Tipo:', notification.event_type);
-            console.log('Arquivo:', notification.file_path);
-            console.log('===================');
-            this.showPrompt();
-        });
-
-        this.isSubscribed = true;
-        console.log(`Inscrito para notificações em: ${paths.join(', ')}`);
-    }
-
-    private async handleUnsubscribe() {
-        await this.fileClient.unsubscribe();
-        this.isSubscribed = false;
-        console.log('Assinaturas canceladas. Não receberá mais notificações.');
     }
 }

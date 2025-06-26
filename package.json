@@ -7,7 +7,10 @@
     "start": "node dist/app.js",
     "client": "node dist/client.js",
     "dev": "ts-node src/client.ts",
-    "dev:server": "ts-node src/app.ts",
+    "dev:server": "cross-env IS_STORAGE_NODE=false NODE_ID=server PORT=50050 ENABLE_HEARTBEAT=false ts-node src/app.ts",
+    "dev:node1": "cross-env IS_PRIMARY_NODE=true IS_STORAGE_NODE=true NODE_ID=node1 PORT=50051 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
+    "dev:node2": "cross-env IS_STORAGE_NODE=true NODE_ID=node2 PORT=50052 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
+    "dev:node3": "cross-env IS_STORAGE_NODE=true NODE_ID=node3 PORT=50053 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
     "dev:test": "ts-node src/client/testFiles.ts",
     "dev:test:concurrency": "ts-node src/client/testConcurrencyFiles.ts"
   },
@@ -31,6 +34,7 @@
     "typescript": "^5.8.2"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "ts-node": "^10.9.2"
   }
 }

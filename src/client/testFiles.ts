@@ -128,7 +128,6 @@ class FileTransferValidator {
 
 
         await this.cleanupTestEnvironment();
-        this.fileClient.disconnect();
     }
 }
 

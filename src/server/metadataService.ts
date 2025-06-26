@@ -33,7 +33,6 @@ export class MetadataService {
             checksum: '',
             size: 0
         };
-
         this.fileMetadata.set(filePath, metadata);
         await this.redis.hSet('file_metadata', filePath, JSON.stringify(metadata));
     }
@@ -46,6 +45,13 @@ export class MetadataService {
         this.fileMetadata.set(filePath, updated);
         await this.redis.hSet('file_metadata', filePath, JSON.stringify(updated));
     }
+
+    public async deleteFileMetadata(filePath: string) {
+        this.fileMetadata.delete(filePath);
+        await this.redis.hDel('file_metadata', filePath);
+        console.log(`[MetadataService] Metadado deletado para o arquivo ${filePath}`);
+    }
+
     public async loadAllMetadataFromRedis() {
         const all = await this.redis.hGetAll('file_metadata');
 

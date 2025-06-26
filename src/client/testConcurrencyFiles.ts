@@ -182,7 +182,6 @@ class ConcurrentFileTransferValidator {
         console.log(`- Concorrência máxima: ${this.concurrencyLimit}`);
 
         await this.cleanupTestEnvironment();
-        this.fileClient.disconnect();
     }
 }
 

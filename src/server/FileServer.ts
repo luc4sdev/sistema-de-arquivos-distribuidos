@@ -60,6 +60,7 @@ export class FileServer {
     async deleteFile({ filename }: DeleteFilePayload): Promise<FileOperationResponse> {
         try {
             const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            console.log(fullPath)
             await fs.unlink(fullPath);
             return { status: 'success' };
         } catch (err) {
@@ -96,23 +97,6 @@ export class FileServer {
             return {
                 status: 'error',
                 message: `Erro ao listar arquivos: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async copyFile({ source, destination }: CopyFilePayload): Promise<FileOperationResponse> {
-        try {
-            const sourcePath = this.getNodePath(this.replicationService.currentNodeId, source);
-            const destPath = this.getNodePath(this.replicationService.currentNodeId, destination);
-
-            await fs.mkdir(path.dirname(destPath), { recursive: true });
-            await fs.copyFile(sourcePath, destPath);
-
-            return { status: 'success' };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao copiar arquivo: ${(err as Error).message}`
             };
         }
     }
@@ -221,32 +205,40 @@ export class FileServer {
         filename,
         allowAnyNode = false
     }: GetFileContentPayload): Promise<string> {
-        if (allowAnyNode) {
-            const metadata = this.metadataService.getFileMetadata(filename);
-            if (!metadata) {
-                throw new Error('Arquivo não encontrado nos metadados');
-            }
+        // 1. Verificar metadados primeiro
+        const metadata = this.metadataService.getFileMetadata(filename);
+        if (!metadata) {
+            throw new Error('Arquivo não encontrado nos metadados');
+        }
 
-            // Tenta primeiro no primário
+        // 2. Definir ordem de tentativas
+        const nodesToTry = allowAnyNode
+            ? [metadata.primaryNode, ...metadata.replicaNodes]
+            : [this.replicationService.currentNodeId];
+
+        // 3. Tentar ler em cada nó
+        for (const node of nodesToTry) {
             try {
-                const primaryPath = this.getNodePath(metadata.primaryNode, filename);
-                return await fs.readFile(primaryPath, 'utf-8');
-            } catch (err) {
-                // Se falhar, tenta nas réplicas
-                for (const node of metadata.replicaNodes) {
-                    try {
-                        const nodePath = this.getNodePath(node, filename);
-                        return await fs.readFile(nodePath, 'utf-8');
-                    } catch {
+                const nodePath = this.getNodePath(node, filename);
+                const content = await fs.readFile(nodePath, 'utf-8');
+
+                // Verificar checksum se for o primário
+                if (node === metadata.primaryNode) {
+                    const currentChecksum = this.replicationService.calculateChecksumFromString(content);
+                    if (currentChecksum !== metadata.checksum) {
+                        console.warn(`Checksum divergente no primário para ${filename}`);
                         continue;
                     }
                 }
-                throw new Error('Não foi possível ler o arquivo em nenhum nó');
+
+                return content;
+            } catch (err) {
+                console.warn(`Falha ao ler ${filename} no nó ${node}:`, err);
+                continue;
             }
-        } else {
-            const localPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            return await fs.readFile(localPath, 'utf-8');
         }
+
+        throw new Error('Não foi possível ler o arquivo em nenhum nó disponível');
     }
 
     private async isDirectory(path: string): Promise<boolean> {
