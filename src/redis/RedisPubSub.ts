@@ -24,7 +24,7 @@ export class RedisPubSub {
         await this.publisher.publish(channel, JSON.stringify(message));
     }
 
-    public async subscribe(channel: string, callback: (msg: Notification) => void) {
+    public async subscribe(channel: string, callback: (msg: Notification) => void | Promise<void>) {
         if (this.subscribedChannels.has(channel)) {
             return;
         }

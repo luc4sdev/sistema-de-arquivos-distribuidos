@@ -13,12 +13,21 @@ service FileSystem {
   rpc ListFiles (ListFilesRequest) returns (ListFilesResponse) {}
   rpc CopyFile (CopyFileRequest) returns (FileOperationResponse) {}
   rpc DownloadFile (DownloadFileRequest) returns (DownloadFileResponse) {}
+  rpc UploadFile (stream FileChunk) returns (FileOperationResponse);
 }
 
 // Mensagens de requisição
 message CreateFileRequest {
   string filename = 1;
   string content = 2;
+}
+
+message FileChunk {
+    string filename = 1;
+    bytes chunk = 2;
+    int32 chunk_number = 3;
+    int32 total_chunks = 4;
+    string checksum = 5;
 }
 
 message ReadFileRequest {

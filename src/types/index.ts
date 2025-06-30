@@ -66,7 +66,10 @@ export interface PerformanceMetrics {
     timeMs: number;
 }
 
-export type EventType = 'CREATE' | 'DELETE' | 'UPDATE' | 'RENAME' | 'MOVE' | 'NODE_HEARTBEAT' | 'REPLICATION_REQUEST' | 'FILE_EVENT' | 'CHECKSUM_REQUEST' | 'CHECKSUM_RESPONSE' | 'NODE_JOIN' | 'FILE_OPERATION';
+export type EventType = 'CREATE' | 'DELETE' | 'UPDATE'
+    | 'NODE_HEARTBEAT' | 'REPLICATION_REQUEST' | 'CHECKSUM_REQUEST'
+    | 'CHECKSUM_RESPONSE' | 'NODE_JOIN' | 'FILE_OPERATION' | 'CHUNK_REPLICATION' | 'FILE_CHUNK'
+    | 'FILE_READ_REQUEST' | 'FILE_READ_RESPONSE';
 
 
 export interface Notification {

@@ -2,9 +2,11 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { FileOperationResponse } from '../types';
 
 const PROTO_PATH = path.join(__dirname, '../proto/filesystem.proto');
+const CHUNK_SIZE = 1024 * 1024; // 1 MB
 
 export class FileClient {
     private client: any;
@@ -107,19 +109,6 @@ export class FileClient {
         });
     }
 
-    public async copyFile(source: string, destination: string): Promise<FileOperationResponse> {
-        return new Promise((resolve, reject) => {
-            this.client.CopyFile({ source, destination }, (err: any, response: any) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                console.log('Copiar arquivo:', response, `Tempo: ${response.timeMs}ms`);
-                resolve(response);
-            });
-        });
-    }
-
     public async downloadFile(remotePath: string, outputName?: string): Promise<FileOperationResponse> {
         return new Promise((resolve, reject) => {
             this.client.DownloadFile({
@@ -146,13 +135,42 @@ export class FileClient {
         });
     }
 
-    public async runExampleOperations(): Promise<void> {
-        await this.createFile('teste.txt', 'Hello World\n');
-        await this.listFiles();
-        await this.readFile('teste.txt');
-        await this.copyFile('teste.txt', 'copia_teste.txt');
-        await this.writeFile('teste.txt', 'Mais texto\n');
-        await this.readFile('teste.txt');
-        await this.downloadFile('teste.txt');
+    public async uploadFile(localPath: string, remoteFilename: string): Promise<FileOperationResponse> {
+        return new Promise((resolve, reject) => {
+            const stream = fs.createReadStream(localPath, { highWaterMark: CHUNK_SIZE });
+            const call = this.client.UploadFile((err: any, response: any) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    console.log('Upload completo:', response);
+                    resolve(response);
+                }
+            });
+
+            let chunkNumber = 0;
+            const fileSize = fs.statSync(localPath).size;
+            const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+
+            stream.on('data', (chunk: Buffer | string) => {
+                const chunkChecksum = crypto.createHash('sha256').update(chunk).digest('hex');
+                call.write({
+                    filename: remoteFilename,
+                    chunk: chunk,
+                    chunk_number: chunkNumber,
+                    total_chunks: totalChunks,
+                    checksum: chunkChecksum
+                });
+                chunkNumber++;
+            });
+
+            stream.on('end', () => {
+                call.end();
+            });
+
+            stream.on('error', (err) => {
+                call.cancel();
+                reject(err);
+            });
+        });
     }
 }

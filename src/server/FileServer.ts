@@ -1,14 +1,12 @@
 import { promises as fs } from 'fs';
+import crypto from 'crypto';
 import path from 'path';
 import {
     FileOperationResponse,
     CreateFilePayload,
-    ReadFilePayload,
     WriteFilePayload,
     DeleteFilePayload,
     ListFilesPayload,
-    DownloadFilePayload,
-    CopyFilePayload,
     ReadFileWithFallbackPayload,
     DownloadFileWithFallbackPayload,
     GetFileContentPayload
@@ -17,6 +15,12 @@ import { MetadataService } from './metadataService';
 import { ReplicationService } from './replicationService';
 
 export class FileServer {
+    private chunkBuffers = new Map<string, {
+        chunks: Buffer[];
+        totalChunks: number;
+        checksums: string[];
+    }>();
+
     constructor(
         private metadataService: MetadataService,
         private replicationService: ReplicationService,
@@ -60,7 +64,6 @@ export class FileServer {
     async deleteFile({ filename }: DeleteFilePayload): Promise<FileOperationResponse> {
         try {
             const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            console.log(fullPath)
             await fs.unlink(fullPath);
             return { status: 'success' };
         } catch (err) {
@@ -239,6 +242,48 @@ export class FileServer {
         }
 
         throw new Error('Não foi possível ler o arquivo em nenhum nó disponível');
+    }
+
+    async handleFileChunk(chunkData: {
+        filename: string;
+        chunk: Buffer;
+        chunkNumber: number;
+        totalChunks: number;
+        checksum: string;
+    }): Promise<void> {
+        // Verificar checksum
+        const calculatedChecksum = crypto.createHash('sha256')
+            .update(chunkData.chunk)
+            .digest('hex');
+
+        if (calculatedChecksum !== chunkData.checksum) {
+            throw new Error(`Checksum inválido para chunk ${chunkData.chunkNumber}`);
+        }
+
+        // Armazenar chunk temporariamente
+        if (!this.chunkBuffers.has(chunkData.filename)) {
+            this.chunkBuffers.set(chunkData.filename, {
+                chunks: Array(chunkData.totalChunks),
+                totalChunks: chunkData.totalChunks,
+                checksums: []
+            });
+        }
+
+        const fileData = this.chunkBuffers.get(chunkData.filename)!;
+        fileData.chunks[chunkData.chunkNumber] = chunkData.chunk;
+        fileData.checksums.push(chunkData.checksum);
+
+        // Se todos os chunks foram recebidos, montar o arquivo
+        if (fileData.checksums.length === chunkData.totalChunks) {
+            const fullContent = Buffer.concat(fileData.chunks);
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, chunkData.filename);
+
+            await fs.mkdir(path.dirname(fullPath), { recursive: true });
+            await fs.writeFile(fullPath, fullContent);
+
+            console.log(`[CHUNK] Arquivo ${chunkData.filename} montado com sucesso (${fullContent.length} bytes)`);
+            this.chunkBuffers.delete(chunkData.filename);
+        }
     }
 
     private async isDirectory(path: string): Promise<boolean> {

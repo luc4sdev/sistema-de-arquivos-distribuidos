@@ -1,5 +1,7 @@
 import { FileClient } from './FileClient';
 import * as readline from 'readline';
+import * as fs from 'fs';
+import path from 'path';
 
 export class Cli {
     private fileClient: FileClient;
@@ -21,8 +23,8 @@ export class Cli {
         console.log('  write <nome> <conteúdo>  - Atualiza um arquivo');
         console.log('  delete <nome>            - Remove um arquivo');
         console.log('  list [path]              - Lista arquivos');
-        console.log('  copy <origem> <destino>  - Copia um arquivo');
         console.log('  download <remoto> [local]- Baixa um arquivo');
+        console.log('  upload <local> <remoto> - Envia um arquivo grande em chunks');
         console.log('  exit                     - Sai do programa');
 
         this.fileClient.onConnect(() => {
@@ -56,11 +58,11 @@ export class Cli {
                     case 'list':
                         await this.handleList(args);
                         break;
-                    case 'copy':
-                        await this.handleCopy(args);
-                        break;
                     case 'download':
                         await this.handleDownload(args);
+                        break;
+                    case 'upload':
+                        await this.handleUpload(args);
                         break;
                     case 'exit':
                         this.rl.close();
@@ -117,14 +119,6 @@ export class Cli {
         await this.fileClient.listFiles(path);
     }
 
-    private async handleCopy(args: string[]) {
-        if (args.length < 2) {
-            console.log('Uso: copy <origem> <destino>');
-            return;
-        }
-        await this.fileClient.copyFile(args[0], args[1]);
-    }
-
     private async handleDownload(args: string[]) {
         if (args.length < 1) {
             console.log('Uso: download <arquivo_remoto> [arquivo_local]');
@@ -132,5 +126,27 @@ export class Cli {
         }
         const outputPath = args.length > 1 ? args[1] : undefined;
         await this.fileClient.downloadFile(args[0], outputPath);
+    }
+
+    private async handleUpload(args: string[]) {
+        if (args.length < 2) {
+            console.log('Uso: upload <caminho_local> <nome_remoto>');
+            return;
+        }
+        const localPath = path.resolve(__dirname, '../../localFiles', args[0]);
+        const remoteFilename = args[1];
+
+        try {
+            if (!fs.existsSync(localPath)) {
+                console.log(`Arquivo local não encontrado: ${localPath}`);
+                return;
+            }
+
+            console.log(`Iniciando upload de ${localPath} como ${remoteFilename}...`);
+            await this.fileClient.uploadFile(localPath, remoteFilename);
+            console.log('Upload concluído com sucesso!');
+        } catch (error) {
+            console.error('Erro durante upload:', error instanceof Error ? error.message : error);
+        }
     }
 }

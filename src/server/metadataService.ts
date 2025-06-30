@@ -2,10 +2,11 @@ import { FileMetadata, NodeStatus } from '../types';
 import { RedisClientType } from 'redis';
 
 const REPLICATION_FACTOR = 2;
+const NODE_HASH = 'node_status';
 
 export class MetadataService {
     private fileMetadata: Map<string, FileMetadata> = new Map();
-    private nodeStatus: Map<string, NodeStatus> = new Map();
+    private nodeStatus = new Map<string, NodeStatus>();
     private redis: RedisClientType;
 
     constructor(redisClient: RedisClientType) {
@@ -70,24 +71,34 @@ export class MetadataService {
 
     // ----- NÓS -----
 
-    public registerNode(nodeId: string, initialStatus: NodeStatus) {
-        if (!this.nodeStatus.has(nodeId)) {
-            this.nodeStatus.set(nodeId, initialStatus);
+    public async getNodeStatus(id: string): Promise<NodeStatus | undefined> {
+        const raw = await this.redis.hGet('node_status', id);
+        if (!raw) return undefined;
+
+        try {
+            return JSON.parse(raw) as NodeStatus;
+        } catch (err) {
+            console.error(`[MetadataService] Erro ao parsear status do nó ${id}:`, err);
+            return undefined;
         }
     }
 
-    public updateNodeStatus(nodeId: string, status: NodeStatus) {
-        this.nodeStatus.set(nodeId, status);
+
+    public registerNode(id: string, status: NodeStatus) {
+        if (!this.nodeStatus.has(id)) {
+            this.nodeStatus.set(id, status);
+            void this.redis.hSet(NODE_HASH, { [id]: JSON.stringify(status) });
+        }
     }
 
-    public getNodeStatus(nodeId: string): NodeStatus | undefined {
-        return this.nodeStatus.get(nodeId);
+    public updateNodeStatus(id: string, status: NodeStatus) {
+        this.nodeStatus.set(id, status);
+        void this.redis.hSet(NODE_HASH, { [id]: JSON.stringify(status) });
     }
-
     public getAvailableNodes(): string[] {
-        return Array.from(this.nodeStatus.entries())
-            .filter(([_, status]) => status.status === 'ONLINE')
-            .map(([nodeId]) => nodeId);
+        return [...this.nodeStatus]
+            .filter(([, st]) => st.status === 'ONLINE')
+            .map(([id]) => id);
     }
 
     public findNewReplicaCandidates(excludeNodes: string[] = []): string[] {
@@ -116,12 +127,43 @@ export class MetadataService {
         this.redis.hSet('file_metadata', filePath, JSON.stringify(updatedMetadata));
     }
 
+
+
     public getAllNodes(): Record<string, NodeStatus> {
-        const result: Record<string, NodeStatus> = {};
-        for (const [nodeId, status] of this.nodeStatus.entries()) {
-            result[nodeId] = status;
-        }
-        return result;
+        const obj: Record<string, NodeStatus> = {};
+        for (const [id, st] of this.nodeStatus) obj[id] = st;
+        return obj;
     }
+
+    public async loadAllFromRedis(): Promise<void> {
+
+        /* nós -------------------------------------------------------------- */
+        const nodes = await this.redis.hGetAll(NODE_HASH);
+        for (const [id, raw] of Object.entries(nodes)) {
+            try {
+                this.nodeStatus.set(id, JSON.parse(raw as string));
+            } catch (e) {
+                console.error(`[MetadataService] Falha ao parsear node ${id}`, e);
+            }
+        }
+
+        console.log(
+            `[MetadataService] Cache populado: ` +
+            `${this.fileMetadata.size} arquivos | ${this.nodeStatus.size} nós`
+        );
+    }
+    public async clearAllMetadata(): Promise<void> {
+        try {
+            this.fileMetadata.clear();
+
+            await this.redis.del('file_metadata');
+
+            console.log('[MetadataService] Todos os metadados foram apagados.');
+        } catch (err) {
+            console.error('[MetadataService] Falha ao limpar metadados:', err);
+            throw err;
+        }
+    }
+
 
 }
