@@ -1,7 +1,7 @@
 import { RedisPubSub } from '../redis/RedisPubSub';
 import { MetadataService } from './metadataService';
 import { readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import path, { join } from 'path';
 import { FileMetadata, Notification } from '../types';
 import * as crypto from 'crypto';
 import { FileServer } from './FileServer';
@@ -194,6 +194,37 @@ export class ReplicationService {
       }
     });
 
+    this.pubSub.subscribe('file_list_requests', async (msg: Notification) => {
+      const { requestId, targetNode } = JSON.parse(msg.additional_info || '{}');
+
+      if (targetNode !== this.currentNodeId) return; // Garante que só o nó certo responde
+
+      const responseChannel = `file_list_responses:${requestId}`;
+
+      try {
+        const nodePath = path.join(this.storagePath, this.currentNodeId);
+
+        const files = await this.getAllFilesRecursively(nodePath);
+        console.log(files)
+        await this.pubSub.publish(responseChannel, {
+          event_type: 'FILE_LIST_RESPONSE',
+          file_path: '',
+          timestamp: Date.now(),
+          additional_info: JSON.stringify({ files })
+        });
+
+      } catch (err) {
+        await this.pubSub.publish(responseChannel, {
+          event_type: 'FILE_LIST_RESPONSE',
+          file_path: '',
+          timestamp: Date.now(),
+          additional_info: JSON.stringify({ error: (err as Error).message })
+        });
+      }
+    });
+
+
+
 
   }
 
@@ -364,13 +395,15 @@ export class ReplicationService {
     try {
       await this.processLocalOperation(filePath, operation as any, content);
 
-      if (!this.metadataService.getFileMetadata(filePath))
-        await this.metadataService.registerFile(filePath, sourceNode, []);
+      if (operation !== 'DELETE') {
+        if (!this.metadataService.getFileMetadata(filePath))
+          await this.metadataService.registerFile(filePath, sourceNode, []);
 
-      await this.metadataService.updateFileMetadata(filePath, {
-        version, checksum, lastUpdated: new Date(),
-        size: operation === 'DELETE' ? 0 : content.length
-      });
+        await this.metadataService.updateFileMetadata(filePath, {
+          version, checksum, lastUpdated: new Date(),
+          size: operation === 'DELETE' ? 0 : content.length
+        });
+      }
     } catch (err) {
       console.error(`Falha ao processar replicação para ${filePath}:`, err);
     }
@@ -711,6 +744,27 @@ export class ReplicationService {
       })
     });
   }
+
+  private async getAllFilesRecursively(basePath: string): Promise<{ name: string, is_directory: boolean }[]> {
+    const results: { name: string, is_directory: boolean }[] = [];
+
+    const walk = async (dir: string, prefix = '') => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const relPath = path.join(prefix, entry.name);
+        results.push({ name: relPath, is_directory: entry.isDirectory() });
+
+        if (entry.isDirectory()) {
+          await walk(path.join(dir, entry.name), relPath);
+        }
+      }
+    };
+
+    await walk(basePath);
+    return results;
+  }
+
   /* ---------- UTIL ---------- */
 
   private getFilePath(filePath: string): string {

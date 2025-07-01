@@ -58,6 +58,7 @@ export class GRPCServer {
             CopyFile: this.wrapWithMetrics(this.copyFile.bind(this), 'copy'),
             DownloadFile: this.wrapWithMetrics(this.downloadFile.bind(this), 'download'),
             UploadFile: this.handleUploadFile.bind(this),
+            ListFiles: this.listFiles.bind(this),
             Subscribe: this.subscribe.bind(this)
         });
     }
@@ -78,7 +79,7 @@ export class GRPCServer {
 
     private async createFile(call: any): Promise<any> {
         const { filename, content } = call.request;
-
+        const start = Date.now();
         try {
             await this.pubSub.publish('file_operations', {
                 event_type: 'FILE_OPERATION',
@@ -89,9 +90,10 @@ export class GRPCServer {
                     content,
                 })
             });
-
+            const time_ms = Date.now() - start;  // calcula o tempo decorrido
             return {
                 status: 'success',
+                time_ms
             };
         } catch (err) {
             console.error(`Erro ao criar arquivo ${filename}:`, err);
@@ -101,7 +103,7 @@ export class GRPCServer {
 
     private async writeFile(call: any): Promise<any> {
         const { filename, content } = call.request;
-
+        const start = Date.now();
         try {
             await this.pubSub.publish('file_operations', {
                 event_type: 'FILE_OPERATION',
@@ -112,9 +114,10 @@ export class GRPCServer {
                     content,
                 })
             });
-
+            const time_ms = Date.now() - start;  // calcula o tempo decorrido
             return {
                 status: 'success',
+                time_ms
             };
         } catch (err) {
             console.error(`Erro ao atualizar arquivo ${filename}:`, err);
@@ -124,7 +127,7 @@ export class GRPCServer {
 
     private async deleteFile(call: any): Promise<any> {
         const { filename } = call.request;
-
+        const start = Date.now();
         try {
             await this.pubSub.publish('file_operations', {
                 event_type: 'FILE_OPERATION',
@@ -134,8 +137,8 @@ export class GRPCServer {
                     operation: 'DELETE',
                 })
             });
-
-            return { status: 'success' };
+            const time_ms = Date.now() - start;  // calcula o tempo decorridos
+            return { status: 'success', time_ms };
         } catch (err) {
             console.error(`Erro ao deletar arquivo ${filename}:`, err);
             throw err;
@@ -177,7 +180,7 @@ export class GRPCServer {
         const { filename } = call.request;
         await this.metadataService.loadAllMetadataFromRedis();
         await this.metadataService.loadAllFromRedis();
-
+        const start = Date.now();
         try {
             /* 1. Metadados */
             const meta = this.metadataService.getFileMetadata(filename);
@@ -230,7 +233,8 @@ export class GRPCServer {
             });
 
             const content = await contentPromise;
-            return { status: 'success', content, node: targetNode };
+            const time_ms = Date.now() - start;  // calcula o tempo decorrido
+            return { status: 'success', content, time_ms, node: targetNode };
 
         } catch (err) {
             console.error(`Erro ao ler arquivo ${filename}:`, err);
@@ -266,7 +270,7 @@ export class GRPCServer {
         let filename = '';
         let totalChunks = 0;
         let receivedChunks = 0;
-
+        const start = Date.now();
         call.on('data', async (chunk: any) => {
             try {
                 if (!filename) {
@@ -314,9 +318,10 @@ export class GRPCServer {
                 }
 
                 console.log(`Todos os chunks (${totalChunks}) foram enviados via Redis para o nó primário.`);
-
+                const time_ms = Date.now() - start;  // calcula o tempo decorrido
                 callback(null, {
                     status: 'success',
+                    time_ms,
                     message: 'Chunks enviados com sucesso para o primário via Redis'
                 });
             } catch (err) {
@@ -336,6 +341,42 @@ export class GRPCServer {
             });
         });
     }
+
+
+    private listFiles(
+        call: grpc.ServerUnaryCall<any, any>,
+        callback: grpc.sendUnaryData<any>
+    ): void {
+        const start = Date.now();  // marca início
+
+        this.metadataService.loadAllMetadataFromRedis()
+            .then(() => {
+                const allFiles = this.metadataService.getAllFiles();
+                const dirPath = call.request.path ?? '';
+                const files = dirPath
+                    ? allFiles.filter(f => f.startsWith(dirPath))
+                    : allFiles;
+
+                const time_ms = Date.now() - start;  // calcula o tempo decorrido
+
+                callback(null, {
+                    status: 'success',
+                    message: '',
+                    files,
+                    time_ms,
+                });
+            })
+            .catch((err) => {
+                console.error('Erro ao listar arquivos via metadados:', err);
+                callback({
+                    code: grpc.status.INTERNAL,
+                    message: 'Erro ao listar arquivos'
+                });
+            });
+    }
+
+
+
 
     private async subscribe(call: grpc.ServerWritableStream<any, any>) {
         const subscriptionService = new SubscriptionService(this.pubSub);

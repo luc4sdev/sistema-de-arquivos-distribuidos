@@ -74,7 +74,7 @@ message ReadFileResponse {
 message ListFilesResponse {
   string status = 1;
   string message = 2;
-  repeated FileInfo files = 3;
+  repeated string files = 3;
   int64 time_ms = 4;
 }
 

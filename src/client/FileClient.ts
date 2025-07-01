@@ -45,7 +45,7 @@ export class FileClient {
                     reject(err);
                     return;
                 }
-                console.log('Criar arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                console.log('Criar arquivo:', response, `Tempo: ${response.time_ms}ms`);
                 resolve(response);
             });
         });
@@ -58,7 +58,7 @@ export class FileClient {
                     reject(err);
                     return;
                 }
-                console.log('Ler arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                console.log('Ler arquivo:', response, `Tempo: ${response.time_ms}ms`);
                 resolve(response);
             });
         });
@@ -71,7 +71,7 @@ export class FileClient {
                     reject(err);
                     return;
                 }
-                console.log('Escrever arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                console.log('Escrever arquivo:', response, `Tempo: ${response.time_ms}ms`);
                 resolve(response);
             });
         });
@@ -84,7 +84,7 @@ export class FileClient {
                     reject(err);
                     return;
                 }
-                console.log('Excluir arquivo:', response, `Tempo: ${response.timeMs}ms`);
+                console.log('Excluir arquivo:', response, `Tempo: ${response.time_ms}ms`);
                 resolve(response);
             });
         });
@@ -97,13 +97,17 @@ export class FileClient {
                     reject(err);
                     return;
                 }
-                console.log('Listar arquivos:', response, `Tempo: ${response.timeMs}ms`);
-                if (response.files) {
-                    console.log('Arquivos:');
+                console.log(`📁 Listar arquivos`);
+                console.log(`⏱️ Tempo de resposta: ${response.time_ms ?? 'desconhecido'}ms`);
+
+                if (response.files?.length > 0) {
                     response.files.forEach((file: any) => {
-                        console.log(`- ${file.name}${file.isDirectory ? '/' : ''}`);
+                        console.log(`- ${file}`);
                     });
+                } else {
+                    console.log('⚠️ Nenhum arquivo encontrado.');
                 }
+
                 resolve(response);
             });
         });

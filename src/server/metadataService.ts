@@ -56,6 +56,9 @@ export class MetadataService {
     public async loadAllMetadataFromRedis() {
         const all = await this.redis.hGetAll('file_metadata');
 
+        // Limpa cache local antes de repopular
+        this.fileMetadata.clear();
+
         for (const [filePath, value] of Object.entries(all)) {
             const strValue = typeof value === 'string' ? value : String(value);
             try {
@@ -68,6 +71,7 @@ export class MetadataService {
 
         console.log(`[MetadataService] Metadados carregados do Redis: ${this.fileMetadata.size} arquivos.`);
     }
+
 
     // ----- NÓS -----
 
@@ -152,6 +156,18 @@ export class MetadataService {
             `${this.fileMetadata.size} arquivos | ${this.nodeStatus.size} nós`
         );
     }
+
+    public async listAllFilesFromMetadata(): Promise<{ status: string; files: string[] }> {
+        await this.loadAllMetadataFromRedis(); // garante que está atualizado
+
+        const files = this.getAllFiles(); // caminhos dos arquivos
+
+        return {
+            status: 'success',
+            files
+        };
+    }
+
     public async clearAllMetadata(): Promise<void> {
         try {
             this.fileMetadata.clear();
