@@ -9,7 +9,7 @@ const storagePath = process.env.STORAGE_PATH || './nodes';
     const pubSub = new RedisPubSub();
     const redisClient = pubSub.getClient();
     const metadataService = new MetadataService(redisClient);
-    const replicationService = new ReplicationService(metadataService, pubSub, nodeId, storagePath);
+    const replicationService = new ReplicationService(metadataService, pubSub, storagePath);
     await replicationService.initialize();
     console.log(`[NODE] ${nodeId} iniciado com sucesso como nó de replicação.`);
 })();

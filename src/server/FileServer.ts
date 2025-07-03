@@ -1,18 +1,9 @@
 import { promises as fs } from 'fs';
 import crypto from 'crypto';
 import path from 'path';
-import {
-    FileOperationResponse,
-    CreateFilePayload,
-    WriteFilePayload,
-    DeleteFilePayload,
-    ListFilesPayload,
-    ReadFileWithFallbackPayload,
-    DownloadFileWithFallbackPayload,
-    GetFileContentPayload
-} from '../types';
 import { MetadataService } from './metadataService';
 import { ReplicationService } from './replicationService';
+import { FileOperationResponse, FileChunkData } from '../types';
 
 export class FileServer {
     private chunkBuffers = new Map<string, {
@@ -26,272 +17,270 @@ export class FileServer {
         private replicationService: ReplicationService,
         private storageBasePath: string = './nodes'
     ) {
-        // Garante que o diretório base existe
-        fs.mkdir(this.storageBasePath, { recursive: true }).catch(console.error);
+        this.ensureBaseDirectory();
+    }
+
+    private async ensureBaseDirectory(): Promise<void> {
+        try {
+            await fs.mkdir(this.storageBasePath, { recursive: true });
+        } catch (err) {
+            console.error('Erro ao criar diretório base:', err);
+        }
     }
 
     private getNodePath(nodeId: string, filePath: string): string {
         return path.join(this.storageBasePath, nodeId, filePath);
     }
 
-    async createFile({ filename, content }: CreateFilePayload): Promise<FileOperationResponse> {
+    public async createFile(filename: string, content: string): Promise<FileOperationResponse> {
         try {
             const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
             await fs.mkdir(path.dirname(fullPath), { recursive: true });
             await fs.writeFile(fullPath, content);
-            return { status: 'success' };
+
+            return {
+                status: 'success',
+                message: 'Arquivo criado com sucesso'
+            };
         } catch (err) {
+            console.error(`Erro ao criar arquivo ${filename}:`, err);
             return {
                 status: 'error',
-                message: `Erro ao criar arquivo: ${(err as Error).message}`
+                message: `Falha ao criar arquivo: ${(err as Error).message}`
             };
         }
     }
 
-    async writeFile({ filename, content }: WriteFilePayload): Promise<FileOperationResponse> {
+    public async writeFile(filename: string, content: string): Promise<FileOperationResponse> {
         try {
             const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
             await fs.writeFile(fullPath, content);
-            return { status: 'success' };
+
+            return {
+                status: 'success',
+                message: 'Arquivo atualizado com sucesso'
+            };
         } catch (err) {
+            console.error(`Erro ao atualizar arquivo ${filename}:`, err);
             return {
                 status: 'error',
-                message: `Erro ao escrever no arquivo: ${(err as Error).message}`
+                message: `Falha ao atualizar arquivo: ${(err as Error).message}`
             };
         }
     }
 
-    async deleteFile({ filename }: DeleteFilePayload): Promise<FileOperationResponse> {
+    public async deleteFile(filename: string): Promise<FileOperationResponse> {
         try {
             const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
-            await fs.unlink(fullPath);
-            return { status: 'success' };
+
+            // 1. Tenta deletar arquivo completo (se existir)
+            try {
+                await fs.unlink(fullPath);
+            } catch (err) {
+                console.error(`Arquivo completo não encontrado, deletando chunks... ${filename}:`, err);
+            }
+
+            // 2. Deleta chunks (se existirem)
+            await this.deleteAllChunks(filename);
+
+            return {
+                status: 'success',
+                message: 'Arquivo removido com sucesso'
+            };
         } catch (err) {
+            console.error(`Erro ao deletar ${filename}:`, err);
             return {
                 status: 'error',
-                message: `Erro ao deletar arquivo: ${(err as Error).message}`
+                message: `Falha ao deletar arquivo: ${(err as Error).message}`
             };
         }
     }
 
-    async listFiles({ path: filePath = '', nodeId }: ListFilesPayload & { nodeId?: string }): Promise<FileOperationResponse> {
-        try {
-            const targetNode = nodeId || this.replicationService.currentNodeId;
-            const fullPath = this.getNodePath(targetNode, filePath);
+    private async deleteAllChunks(filename: string): Promise<void> {
+        const nodePath = this.getNodePath(this.replicationService.currentNodeId, '');
 
+        try {
+            const files = await fs.readdir(nodePath);
+            const chunkFiles = files.filter(file => file.startsWith(`${filename}.chunk`));
+
+            await Promise.all(
+                chunkFiles.map(file =>
+                    fs.unlink(path.join(nodePath, file)).catch(err => {
+                        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                            console.error(`Erro ao deletar chunk ${file}:`, err);
+                        }
+                    })
+                )
+            );
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw err;
+            }
+        }
+    }
+
+    public async readFile(filename: string): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            const content = await fs.readFile(fullPath, 'utf-8');
+
+            return {
+                status: 'success',
+                content,
+                message: 'Arquivo lido com sucesso'
+            };
+        } catch (err) {
+            console.error(`Erro ao ler arquivo ${filename}:`, err);
+            return {
+                status: 'error',
+                message: `Falha ao ler arquivo: ${(err as Error).message}`
+            };
+        }
+    }
+
+    public async readFileWithFallback(filename: string, preferredNode: string, replicaNodes: string[]): Promise<FileOperationResponse> {
+        try {
+            // Tenta primeiro no nó preferencial
+            try {
+                const response = await this.readFromNode(filename, preferredNode);
+                if (response.status === 'success') {
+                    return { ...response, node: preferredNode };
+                }
+            } catch (err) {
+                console.warn(`Falha ao ler do nó preferencial ${preferredNode}:`, err);
+            }
+
+            // Tenta nas réplicas
+            for (const node of replicaNodes) {
+                try {
+                    const response = await this.readFromNode(filename, node);
+                    if (response.status === 'success') {
+                        return { ...response, node };
+                    }
+                } catch (err) {
+                    console.warn(`Falha ao ler da réplica ${node}:`, err);
+                    continue;
+                }
+            }
+
+            throw new Error('Arquivo não encontrado em nenhum nó disponível');
+        } catch (err) {
+            console.error(`Erro ao ler arquivo ${filename} com fallback:`, err);
+            return {
+                status: 'error',
+                message: `Falha ao ler arquivo: ${(err as Error).message}`
+            };
+        }
+    }
+
+    private async readFromNode(filename: string, nodeId: string): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(nodeId, filename);
+            const content = await fs.readFile(fullPath, 'utf-8');
+
+            return {
+                status: 'success',
+                content,
+                message: 'Arquivo lido com sucesso'
+            };
+        } catch (err) {
+            throw err;
+        }
+    }
+
+    public async handleFileChunk(chunkData: FileChunkData): Promise<FileOperationResponse> {
+        try {
+            // Valida checksum
+            const calculatedChecksum = crypto.createHash('sha256')
+                .update(chunkData.chunk)
+                .digest('hex');
+
+            if (calculatedChecksum !== chunkData.checksum) {
+                throw new Error(`Checksum inválido para chunk ${chunkData.chunkNumber}`);
+            }
+
+            // Armazena chunk temporariamente
+            if (!this.chunkBuffers.has(chunkData.filename)) {
+                this.chunkBuffers.set(chunkData.filename, {
+                    chunks: Array(chunkData.totalChunks),
+                    totalChunks: chunkData.totalChunks,
+                    checksums: []
+                });
+            }
+
+            const fileData = this.chunkBuffers.get(chunkData.filename)!;
+            fileData.chunks[chunkData.chunkNumber] = chunkData.chunk;
+            fileData.checksums.push(chunkData.checksum);
+
+            // Se todos os chunks foram recebidos, monta o arquivo
+            if (fileData.chunks.every(chunk => chunk !== undefined)) {
+                const fullContent = Buffer.concat(fileData.chunks);
+                const fullPath = this.getNodePath(this.replicationService.currentNodeId, chunkData.filename);
+
+                await fs.mkdir(path.dirname(fullPath), { recursive: true });
+                await fs.writeFile(fullPath, fullContent);
+
+                this.chunkBuffers.delete(chunkData.filename);
+
+                return {
+                    status: 'success',
+                    message: `Chunk ${chunkData.chunkNumber + 1}/${chunkData.totalChunks} processado`
+                };
+            }
+
+            return {
+                status: 'success',
+                message: `Chunk ${chunkData.chunkNumber + 1}/${chunkData.totalChunks} recebido`
+            };
+        } catch (err) {
+            console.error(`Erro ao processar chunk ${chunkData.chunkNumber} de ${chunkData.filename}:`, err);
+            return {
+                status: 'error',
+                message: `Falha ao processar chunk: ${(err as Error).message}`
+            };
+        }
+    }
+
+    public async listFiles(directoryPath: string = ''): Promise<FileOperationResponse> {
+        try {
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, directoryPath);
             const files = await fs.readdir(fullPath);
 
-            const filesWithInfo = await Promise.all(
+            const filesWithStats = await Promise.all(
                 files.map(async file => {
-                    const nodePath = path.join(fullPath, file);
+                    const filePath = path.join(fullPath, file);
+                    const stats = await fs.stat(filePath);
                     return {
                         name: file,
-                        isDirectory: await this.isDirectory(nodePath)
+                        isDirectory: stats.isDirectory(),
+                        size: stats.size,
+                        modified: stats.mtime
                     };
                 })
             );
 
             return {
                 status: 'success',
-                files: filesWithInfo,
-                node: targetNode
+                files: filesWithStats,
+                message: 'Listagem obtida com sucesso'
             };
         } catch (err) {
+            console.error(`Erro ao listar arquivos em ${directoryPath}:`, err);
             return {
                 status: 'error',
-                message: `Erro ao listar arquivos: ${(err as Error).message}`
+                message: `Falha ao listar arquivos: ${(err as Error).message}`
             };
         }
     }
 
-    async downloadFileWithFallback({
-        remotePath,
-        outputName,
-        preferredNode,
-        replicaNodes
-    }: DownloadFileWithFallbackPayload): Promise<FileOperationResponse> {
+    public async getFileChecksum(filename: string): Promise<string> {
         try {
-            let content: Buffer | null = null;
-            let lastError: Error | null = null;
-
-            // Tenta primeiro no nó preferencial
-            try {
-                const preferredPath = this.getNodePath(preferredNode, remotePath);
-                content = await fs.readFile(preferredPath);
-            } catch (err) {
-                lastError = err as Error;
-            }
-
-            // Se falhar, tenta nas réplicas
-            if (!content) {
-                for (const node of replicaNodes) {
-                    try {
-                        const nodePath = this.getNodePath(node, remotePath);
-                        content = await fs.readFile(nodePath);
-                        if (content) break;
-                    } catch (err) {
-                        lastError = err as Error;
-                        continue;
-                    }
-                }
-            }
-
-            if (!content) {
-                throw lastError || new Error('Arquivo não encontrado em nenhum nó');
-            }
-
-            return {
-                status: 'success',
-                filename: outputName || path.basename(remotePath),
-                content: content.toString('base64'),
-                node: content ? preferredNode : undefined
-            };
+            const fullPath = this.getNodePath(this.replicationService.currentNodeId, filename);
+            const content = await fs.readFile(fullPath);
+            return crypto.createHash('sha256').update(content).digest('hex');
         } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao baixar arquivo: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async readFileWithFallback({
-        filename,
-        preferredNode,
-        replicaNodes
-    }: ReadFileWithFallbackPayload): Promise<FileOperationResponse> {
-        try {
-            let content: string | null = null;
-            let lastError: Error | null = null;
-
-            // Tenta primeiro no nó preferencial
-            try {
-                const preferredPath = this.getNodePath(preferredNode, filename);
-                content = await fs.readFile(preferredPath, 'utf-8');
-            } catch (err) {
-                lastError = err as Error;
-            }
-
-            // Se falhar, tenta nas réplicas
-            let successfulNode: string | null = null;
-            if (!content) {
-                for (const node of replicaNodes) {
-                    try {
-                        const nodePath = this.getNodePath(node, filename);
-                        content = await fs.readFile(nodePath, 'utf-8');
-                        successfulNode = node;
-                        if (content) break;
-                    } catch (err) {
-                        lastError = err as Error;
-                        continue;
-                    }
-                }
-            }
-
-            if (!content) {
-                throw lastError || new Error('Arquivo não encontrado em nenhum nó');
-            }
-
-            return {
-                status: 'success',
-                content,
-                node: successfulNode || preferredNode
-            };
-        } catch (err) {
-            return {
-                status: 'error',
-                message: `Erro ao ler arquivo: ${(err as Error).message}`
-            };
-        }
-    }
-
-    async getFileContent({
-        filename,
-        allowAnyNode = false
-    }: GetFileContentPayload): Promise<string> {
-        // 1. Verificar metadados primeiro
-        const metadata = this.metadataService.getFileMetadata(filename);
-        if (!metadata) {
-            throw new Error('Arquivo não encontrado nos metadados');
-        }
-
-        // 2. Definir ordem de tentativas
-        const nodesToTry = allowAnyNode
-            ? [metadata.primaryNode, ...metadata.replicaNodes]
-            : [this.replicationService.currentNodeId];
-
-        // 3. Tentar ler em cada nó
-        for (const node of nodesToTry) {
-            try {
-                const nodePath = this.getNodePath(node, filename);
-                const content = await fs.readFile(nodePath, 'utf-8');
-
-                // Verificar checksum se for o primário
-                if (node === metadata.primaryNode) {
-                    const currentChecksum = this.replicationService.calculateChecksumFromString(content);
-                    if (currentChecksum !== metadata.checksum) {
-                        console.warn(`Checksum divergente no primário para ${filename}`);
-                        continue;
-                    }
-                }
-
-                return content;
-            } catch (err) {
-                console.warn(`Falha ao ler ${filename} no nó ${node}:`, err);
-                continue;
-            }
-        }
-
-        throw new Error('Não foi possível ler o arquivo em nenhum nó disponível');
-    }
-
-    async handleFileChunk(chunkData: {
-        filename: string;
-        chunk: Buffer;
-        chunkNumber: number;
-        totalChunks: number;
-        checksum: string;
-    }): Promise<void> {
-        // Verificar checksum
-        const calculatedChecksum = crypto.createHash('sha256')
-            .update(chunkData.chunk)
-            .digest('hex');
-
-        if (calculatedChecksum !== chunkData.checksum) {
-            throw new Error(`Checksum inválido para chunk ${chunkData.chunkNumber}`);
-        }
-
-        // Armazenar chunk temporariamente
-        if (!this.chunkBuffers.has(chunkData.filename)) {
-            this.chunkBuffers.set(chunkData.filename, {
-                chunks: Array(chunkData.totalChunks),
-                totalChunks: chunkData.totalChunks,
-                checksums: []
-            });
-        }
-
-        const fileData = this.chunkBuffers.get(chunkData.filename)!;
-        fileData.chunks[chunkData.chunkNumber] = chunkData.chunk;
-        fileData.checksums.push(chunkData.checksum);
-
-        // Se todos os chunks foram recebidos, montar o arquivo
-        if (fileData.checksums.length === chunkData.totalChunks) {
-            const fullContent = Buffer.concat(fileData.chunks);
-            const fullPath = this.getNodePath(this.replicationService.currentNodeId, chunkData.filename);
-
-            await fs.mkdir(path.dirname(fullPath), { recursive: true });
-            await fs.writeFile(fullPath, fullContent);
-
-            console.log(`[CHUNK] Arquivo ${chunkData.filename} montado com sucesso (${fullContent.length} bytes)`);
-            this.chunkBuffers.delete(chunkData.filename);
-        }
-    }
-
-    private async isDirectory(path: string): Promise<boolean> {
-        try {
-            const stat = await fs.stat(path);
-            return stat.isDirectory();
-        } catch {
-            return false;
+            console.error(`Erro ao calcular checksum de ${filename}:`, err);
+            throw err;
         }
     }
 }

@@ -3,72 +3,44 @@ syntax = "proto3";
 package filesystem;
 
 service FileSystem {
-  // Operações básicas
-  rpc CreateFile (CreateFileRequest) returns (FileOperationResponse) {}
-  rpc ReadFile (ReadFileRequest) returns (ReadFileResponse) {}
-  rpc WriteFile (WriteFileRequest) returns (FileOperationResponse) {}
-  rpc DeleteFile (DeleteFileRequest) returns (FileOperationResponse) {}
+  // Operações básicas de arquivo
+  rpc CreateFile (FileRequest) returns (FileOperationResponse);
+  rpc ReadFile (FileRequest) returns (FileOperationResponse);
+  rpc WriteFile (FileRequest) returns (FileOperationResponse);
+  rpc DeleteFile (FileRequest) returns (FileOperationResponse);
   
-  // Operações avançadas
-  rpc ListFiles (ListFilesRequest) returns (ListFilesResponse) {}
-  rpc CopyFile (CopyFileRequest) returns (FileOperationResponse) {}
-  rpc DownloadFile (DownloadFileRequest) returns (DownloadFileResponse) {}
+  // Operações com chunks
   rpc UploadFile (stream FileChunk) returns (FileOperationResponse);
+  rpc DownloadFile (DownloadFileRequest) returns (stream FileChunk);
+  
+  // Listagem e monitoramento
+  rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
+  rpc Subscribe (SubscriptionRequest) returns (stream Notification);
 }
 
-// Mensagens de requisição
-message CreateFileRequest {
+// Mensagens para operações básicas
+message FileRequest {
   string filename = 1;
   string content = 2;
 }
 
+// Chunk individual do arquivo
 message FileChunk {
-    string filename = 1;
-    bytes chunk = 2;
-    int32 chunk_number = 3;
-    int32 total_chunks = 4;
-    string checksum = 5;
-}
-
-message ReadFileRequest {
   string filename = 1;
+  int32 chunk_number = 2;
+  int32 total_chunks = 3;
+  bytes chunk = 4;
+  string checksum = 5;
 }
 
-message WriteFileRequest {
-  string filename = 1;
-  string content = 2;
-}
-
-message DeleteFileRequest {
-  string filename = 1;
-}
-
-message ListFilesRequest {
-  string path = 1;
-}
-
-message CopyFileRequest {
-  string source = 1;
-  string destination = 2;
-}
-
+// Pedido de download
 message DownloadFileRequest {
   string path = 1;
-  string output_name = 2;
 }
 
-// Mensagens de resposta
-message FileOperationResponse {
-  string status = 1;
-  string message = 2;
-  int64 time_ms = 3;
-}
-
-message ReadFileResponse {
-  string status = 1;
-  string message = 2;
-  string content = 3;
-  int64 time_ms = 4;
+// Listagem de arquivos
+message ListFilesRequest {
+  string path = 1;
 }
 
 message ListFilesResponse {
@@ -78,32 +50,21 @@ message ListFilesResponse {
   int64 time_ms = 4;
 }
 
-message FileInfo {
-  string name = 1;
-  bool is_directory = 2;
-}
-
-message DownloadFileResponse {
+// Resposta genérica
+message FileOperationResponse {
   string status = 1;
   string message = 2;
-  string filename = 3;
-  string content = 4; // Base64 encoded
-  int64 time_ms = 5;
+  int64 time_ms = 3;
 }
 
+// Notificações
 message SubscriptionRequest {
-  string client_id = 1;              // Identificador único do cliente
-  repeated string watch_paths = 2;   // Lista de caminhos para monitorar
-  optional bool recursive = 3;       // Se deve monitorar subdiretórios
-  repeated string event_types = 4;   // Tipos de eventos a filtrar (CREATE, DELETE, etc)
+  string client_id = 1;
 }
 
 message Notification {
-  string event_type = 1;  // CREATE, DELETE, UPDATE, RENAME
+  string event_type = 1;
   string file_path = 2;
   int64 timestamp = 3;
   string additional_info = 4;
-  int64 file_size = 5;
-  string user_id = 6;
-  string original_path = 7;
 }

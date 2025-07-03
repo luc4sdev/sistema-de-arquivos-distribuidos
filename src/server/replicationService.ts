@@ -1,11 +1,11 @@
 import { RedisPubSub } from '../redis/RedisPubSub';
 import { MetadataService } from './metadataService';
-import { readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import path, { join } from 'path';
 import { FileMetadata, Notification } from '../types';
 import * as crypto from 'crypto';
+import * as fs from 'fs/promises';
 import { FileServer } from './FileServer';
-import * as fs from 'fs/promises'
 
 const INTEGRITY_CHECK_INTERVAL = 30000; // 30 seconds
 const HEARTBEAT_INTERVAL = 5000; // 5 seconds
@@ -13,71 +13,39 @@ const REPLICATION_TIMEOUT = 10000; // 10 seconds
 
 export class ReplicationService {
   private healthyNodes: Set<string> = new Set();
-  public currentNodeId: string;
   private storagePath: string;
-  private fileServer: FileServer;
   private readonly isStorageNode = process.env.IS_STORAGE_NODE === 'true';
+  private fileServer: FileServer
 
   private chunkBuffers = new Map<string, {
     chunks: Buffer[];
     totalChunks: number;
     checksums: string[];
-    metadata?: FileMetadata;
   }>();
 
   constructor(
     private metadataService: MetadataService,
     private pubSub: RedisPubSub,
-    nodeId: string,
     storagePath: string = './nodes'
   ) {
-    this.currentNodeId = nodeId;
     this.storagePath = storagePath;
     this.setupSubscriptions();
+    this.fileServer = new FileServer(
+      this.metadataService, this, storagePath)
 
     if (this.isStorageNode) {
       this.startHeartbeat();
       this.startIntegrityChecks();
     }
-
-
-    this.fileServer = new FileServer(this.metadataService, this, this.storagePath);
   }
 
   public async initialize() {
-    if (this.isStorageNode) {
-      this.metadataService.registerNode(this.currentNodeId, {
-        nodeId: this.currentNodeId,
-        status: 'ONLINE',
-        lastHeartbeat: new Date(),
-        storageCapacity: this.getStorageCapacity(),
-        storageUsed: this.getStorageUsed()
-      });
-    }
-
-    await this.metadataService.loadAllMetadataFromRedis();
-    // Inicializa healthyNodes com base nos nós já conhecidos com status ONLINE
-    const allNodes = this.metadataService.getAllNodes();
-    for (const nodeId of Object.keys(allNodes)) {
-      const node = allNodes[nodeId];
-      if (node.status === 'ONLINE') {
-        this.healthyNodes.add(nodeId);
-      }
-    }
-    console.log('[INIT] healthyNodes inicializados:', Array.from(this.healthyNodes));
+    await this.metadataService.loadAllFromRedis();
     this.monitorNodeHealth();
-    if (this.isStorageNode) {
-      this.pubSub.publish('node_sync', {
-        event_type: 'NODE_JOIN',
-        file_path: '',
-        timestamp: Date.now(),
-        additional_info: JSON.stringify({ nodeId: this.currentNodeId })
-      });
-    }
-
   }
 
   private setupSubscriptions() {
+    // Heartbeat handling
     this.pubSub.subscribe('node_status', (msg: Notification) => {
       if (msg.event_type === 'NODE_HEARTBEAT') {
         const status = JSON.parse(msg.additional_info as string);
@@ -89,93 +57,16 @@ export class ReplicationService {
       }
     });
 
+    // Chunk storage handling
+    this.pubSub.subscribe(`chunk_node_${this.currentNodeId}`, this.handleChunkStore.bind(this));
 
-    if (process.env.IS_PRIMARY_NODE === 'true') {
-      this.pubSub.subscribe('file_operations', (msg: Notification) => {
-        const { operation, content } =
-          JSON.parse(msg.additional_info as string);
-        if (msg.event_type === 'FILE_OPERATION') {
-          this.replicateFileOperation(msg.file_path, operation, content);
-        }
-      });
-    }
-
-    if (process.env.IS_PRIMARY_NODE === 'true') {
-      this.pubSub.subscribe('file_chunks', async (msg: Notification) => {
-        if (msg.event_type !== 'FILE_CHUNK') return;
-        try {
-          const data = JSON.parse(msg.additional_info as string);
-
-          // Reverte o chunk de base64 p/ Buffer
-          const chunkBuf = Buffer.from(data.chunk, 'base64');
-
-          await this.handleIncomingChunk({
-            filename: data.filename,
-            chunk: chunkBuf,
-            chunkNumber: data.chunkNumber,
-            totalChunks: data.totalChunks,
-            checksum: data.checksum,
-            sourceNode: data.sourceNode
-          });
-        } catch (err) {
-          console.error('[CHUNK] Erro ao processar FILE_CHUNK:', err);
-        }
-      });
-    }
-
-    if (!process.env.IS_PRIMARY_NODE && process.env.IS_STORAGE_NODE === 'true') {
-      this.pubSub.subscribe('chunk_replication', async (msg: Notification) => {
-        if (msg.event_type !== 'CHUNK_REPLICATION') return;
-        try {
-          const data = JSON.parse(msg.additional_info as string);
-
-          // Reverte o chunk de base64 p/ Buffer
-          const chunkBuf = Buffer.from(data.chunk, 'base64');
-
-          await this.handleIncomingChunk({
-            filename: data.filename,
-            chunk: chunkBuf,
-            chunkNumber: data.chunkNumber,
-            totalChunks: data.totalChunks,
-            checksum: data.checksum,
-            sourceNode: data.sourceNode
-          });
-        } catch (err) {
-          console.error('[CHUNK] Erro ao processar FILE_CHUNK:', err);
-        }
-      });
-
-    }
-
-
-    this.pubSub.subscribe('replication_requests', (msg: Notification) => {
-      if (msg.event_type === 'REPLICATION_REQUEST') {
-        this.handleReplicationRequest(msg);
-      }
-    });
-
-    this.pubSub.subscribe('checksum_requests', (msg: Notification) => {
-      if (msg.event_type === 'CHECKSUM_REQUEST') {
-        this.handleChecksumRequest(msg);
-      }
-    });
-
-    this.pubSub.subscribe('node_sync', async (msg: Notification) => {
-      if (msg.event_type === 'NODE_JOIN') {
-        const { nodeId } = JSON.parse(msg.additional_info || '{}');
-        if (nodeId !== this.currentNodeId) {
-          this.healthyNodes.add(nodeId);
-          if (this.isStorageNode) this.syncFilesToNewNode(nodeId);
-        }
-      }
-    });
-
+    // File read requests handling
     this.pubSub.subscribe('file_read_requests', async (msg: Notification) => {
       const { requestId, targetNode } = JSON.parse(msg.additional_info || '{}');
       if (targetNode !== this.currentNodeId) return;
 
       try {
-        const fullPath = this.getFilePath(msg.file_path);
+        const fullPath = path.join(this.storagePath, targetNode, msg.file_path);
         const content = await fs.readFile(fullPath, 'utf-8');
 
         await this.pubSub.publish(`file_read_responses:${requestId}`, {
@@ -194,38 +85,206 @@ export class ReplicationService {
       }
     });
 
-    this.pubSub.subscribe('file_list_requests', async (msg: Notification) => {
-      const { requestId, targetNode } = JSON.parse(msg.additional_info || '{}');
-
-      if (targetNode !== this.currentNodeId) return; // Garante que só o nó certo responde
-
-      const responseChannel = `file_list_responses:${requestId}`;
-
-      try {
-        const nodePath = path.join(this.storagePath, this.currentNodeId);
-
-        const files = await this.getAllFilesRecursively(nodePath);
-        console.log(files)
-        await this.pubSub.publish(responseChannel, {
-          event_type: 'FILE_LIST_RESPONSE',
-          file_path: '',
-          timestamp: Date.now(),
-          additional_info: JSON.stringify({ files })
-        });
-
-      } catch (err) {
-        await this.pubSub.publish(responseChannel, {
-          event_type: 'FILE_LIST_RESPONSE',
-          file_path: '',
-          timestamp: Date.now(),
-          additional_info: JSON.stringify({ error: (err as Error).message })
-        });
+    this.pubSub.subscribe('file_operations', async (msg: Notification) => {
+      if (msg.event_type === 'FILE_OPERATION') {
+        const { operation, content } = JSON.parse(msg.additional_info || '{}');
+        await this.handleFileOperation(msg.file_path, operation, content);
       }
     });
 
+    this.pubSub.subscribe('delete_requests', async (msg: Notification) => {
+      if (msg.event_type !== 'DELETE_REQUEST') return;
 
+      const { filename, sourceNode } = JSON.parse(msg.additional_info || '{}');
 
+      // Evita loop de deleção
+      if (sourceNode === this.currentNodeId) return;
 
+      try {
+        await this.fileServer.deleteFile(filename);
+      } catch (err) {
+        console.error(`Erro ao processar deleção de ${filename}:`, err);
+      }
+    });
+
+    this.pubSub.subscribe(`chunk_request_${this.currentNodeId}`, async (msg: Notification) => {
+      if (msg.event_type !== 'CHUNK_REQUEST') return;
+
+      try {
+        const { requestId, chunkNumber } = JSON.parse(msg.additional_info || '{}');
+        const filename = msg.file_path;
+        const chunkFilename = `${filename}.chunk${chunkNumber}`;
+        const filePath = path.join(this.storagePath, this.currentNodeId, chunkFilename);
+
+        const chunk = await fs.readFile(filePath);
+        await this.pubSub.publish(`chunk_response_${requestId}`, {
+          event_type: 'CHUNK_RESPONSE',
+          file_path: filename,
+          timestamp: Date.now(),
+          additional_info: JSON.stringify({
+            chunk: chunk.toString('base64')
+          })
+        });
+      } catch (err) {
+
+      }
+    });
+  }
+
+  private async handleChunkStore(msg: Notification) {
+    if (msg.event_type !== 'CHUNK_STORE') return;
+
+    const data = JSON.parse(msg.additional_info as string);
+    const chunkBuf = Buffer.from(data.chunk_base64, 'base64');
+
+    await this.storeChunk({
+      filename: data.filename,
+      chunk: chunkBuf,
+      chunkNumber: data.chunkNumber,
+      totalChunks: data.totalChunks,
+      checksum: data.checksum,
+      isReplica: data.isReplica
+    });
+  }
+
+  private async storeChunk(chunkData: {
+    filename: string;
+    chunk: Buffer;
+    chunkNumber: number;
+    totalChunks: number;
+    checksum: string;
+    isReplica: boolean;
+  }) {
+    // Verificação de checksum
+    const calculatedChecksum = crypto.createHash('sha256')
+      .update(chunkData.chunk)
+      .digest('hex');
+
+    if (calculatedChecksum !== chunkData.checksum) {
+      throw new Error(`Checksum inválido para chunk ${chunkData.chunkNumber}`);
+    }
+
+    // Armazenamento físico
+    const chunkFilename = `${chunkData.filename}.chunk${chunkData.chunkNumber}`;
+    const filePath = path.join(this.storagePath, this.currentNodeId, chunkFilename);
+
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, chunkData.chunk);
+
+    console.log(`Chunk ${chunkData.chunkNumber} armazenado no nó ${this.currentNodeId} como ${chunkFilename}`);
+  }
+
+  public async requestChunkFromNode(nodeId: string, filename: string, chunkNumber: number): Promise<{ chunk: Buffer }> {
+    if (nodeId === this.currentNodeId) {
+      // Se for o próprio nó, busca localmente
+      const chunkFilename = `${filename}.chunk${chunkNumber}`;
+      const filePath = path.join(this.storagePath, this.currentNodeId, chunkFilename);
+      return {
+        chunk: await fs.readFile(filePath)
+      };
+    }
+
+    // Se for outro nó, faz requisição via Redis
+    const requestId = crypto.randomUUID();
+    const responseChannel = `chunk_response_${requestId}`;
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pubSub.unsubscribe(responseChannel);
+        reject(new Error('Timeout ao buscar chunk'));
+      }, 500);
+
+      this.pubSub.subscribe(responseChannel, (msg: Notification) => {
+        clearTimeout(timeout);
+        this.pubSub.unsubscribe(responseChannel);
+
+        try {
+          const { chunk, error } = JSON.parse(msg.additional_info || '{}');
+          if (error) reject(new Error(error));
+          else resolve({ chunk: Buffer.from(chunk, 'base64') });
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      this.pubSub.publish(`chunk_request_${nodeId}`, {
+        event_type: 'CHUNK_REQUEST',
+        file_path: filename,
+        timestamp: Date.now(),
+        additional_info: JSON.stringify({
+          requestId,
+          chunkNumber
+        })
+      });
+    });
+  }
+
+  private async handleFileOperation(
+    filePath: string,
+    operation: 'CREATE' | 'UPDATE' | 'DELETE',
+    content?: string
+  ) {
+    try {
+      switch (operation) {
+        case 'DELETE':
+          await this.replicateDeleteOperation(filePath);
+          break;
+        case 'CREATE':
+        case 'UPDATE':
+          // Lógica existente para create/update
+          break;
+      }
+    } catch (err) {
+      console.error(`Erro ao processar operação ${operation} para ${filePath}:`, err);
+    }
+  }
+  public async replicateDeleteOperation(filePath: string): Promise<void> {
+    // 1. Verifica se o arquivo existe nos metadados
+    const metadata = this.metadataService.getFileMetadata(filePath);
+    if (!metadata) {
+      console.warn(`Arquivo ${filePath} não encontrado nos metadados`);
+      return;
+    }
+
+    // 2. Coleta todos os nós que possuem o arquivo (incluindo chunks)
+    const allNodes = new Set<string>();
+    if (metadata.chunkDistribution) {
+      Object.values(metadata.chunkDistribution).forEach(nodes => {
+        nodes.forEach(node => allNodes.add(node));
+      });
+    } else {
+      // Para arquivos não chunked
+      allNodes.add(metadata.primaryNode);
+      metadata.replicaNodes.forEach(node => allNodes.add(node));
+    }
+
+    // 3. Envia comandos de deleção para todos os nós
+    const deletionPromises = Array.from(allNodes).map(async node => {
+      if (node !== this.currentNodeId) {
+        try {
+          await this.pubSub.publish('delete_requests', {
+            event_type: 'DELETE_REQUEST',
+            file_path: filePath,
+            timestamp: Date.now(),
+            additional_info: JSON.stringify({
+              filename: filePath,
+              sourceNode: this.currentNodeId
+            })
+          });
+        } catch (err) {
+          console.error(`Erro ao enviar delete para nó ${node}:`, err);
+        }
+      }
+    });
+
+    // 4. Deleta localmente e espera outras deleções (não bloqueante)
+    await Promise.all([
+      this.fileServer.deleteFile(filePath),
+      ...deletionPromises
+    ]);
+
+    // 5. Remove metadados APÓS garantir a deleção local
+    await this.metadataService.deleteFileMetadata(filePath);
   }
 
   private startHeartbeat() {
@@ -242,7 +301,6 @@ export class ReplicationService {
           storageUsed: this.getStorageUsed()
         })
       });
-      console.log('[HEARTBEAT] Enviado de', this.currentNodeId)
     }, HEARTBEAT_INTERVAL);
   }
 
@@ -250,26 +308,23 @@ export class ReplicationService {
     setInterval(() => {
       const now = Date.now();
       const TIMEOUT = 15000; // 15 segundos
-      console.log('[HEALTHCHECK] Verificando nós...');
-      for (const [nodeId, status] of Object.entries(this.metadataService.getAllNodes())) {
-        const last = new Date(status.lastHeartbeat).getTime();
-        if ((now - last) > TIMEOUT) {
-          if (this.healthyNodes.has(nodeId)) {
-            console.warn(`[HEALTHCHECK] Nó ${nodeId} está offline (último heartbeat há ${now - last} ms)`);
-            this.healthyNodes.delete(nodeId);
-            this.metadataService.updateNodeStatus(nodeId, {
-              nodeId,
-              status: 'OFFLINE',
-              lastHeartbeat: new Date(),
-              storageCapacity: status.storageCapacity,
-              storageUsed: status.storageUsed
-            });
-          }
+
+      for (const nodeId of this.healthyNodes) {
+        const status = this.metadataService.getNodeStatusSync(nodeId);
+        if (!status || (now - new Date(status.lastHeartbeat).getTime()) > TIMEOUT) {
+          console.warn(`[HEALTHCHECK] Nó ${nodeId} está offline`);
+          this.healthyNodes.delete(nodeId);
+          this.metadataService.updateNodeStatus(nodeId, {
+            nodeId,
+            status: 'OFFLINE',
+            lastHeartbeat: new Date(),
+            storageCapacity: status?.storageCapacity || 0,
+            storageUsed: status?.storageUsed || 0
+          });
         }
       }
-    }, 5000); // verifica a cada 5s
+    }, 5000);
   }
-
 
   private startIntegrityChecks() {
     setInterval(() => {
@@ -277,505 +332,249 @@ export class ReplicationService {
     }, INTEGRITY_CHECK_INTERVAL);
   }
 
-  public async replicateFileOperation(
-    filePath: string,
-    operation: 'CREATE' | 'UPDATE' | 'DELETE',
-    content?: string
-  ): Promise<{ newVersion: number, checksum: string }> {
-    let metadata = this.metadataService.getFileMetadata(filePath);
+  public async handleIncomingChunk(chunkData: {
+    filename: string;
+    chunk: Buffer;
+    chunkNumber: number;
+    totalChunks: number;
+    checksum: string;
+    targetNodes: string[];
+  }): Promise<void> {
+    const { filename, chunk, chunkNumber, totalChunks, checksum, targetNodes } = chunkData;
 
-    // Se for CREATE e não existir metadado, registrar novo
-    if (operation === 'CREATE' && !metadata) {
-      const replicaNodes = this.metadataService.findNewReplicaCandidates([this.currentNodeId]);
-      await this.metadataService.registerFile(filePath, this.currentNodeId, replicaNodes);
-      metadata = this.metadataService.getFileMetadata(filePath);
-    }
-
-    if (!metadata) {
-      throw new Error(`Metadados não encontrados para ${filePath}`);
-    }
-
-    await this.processLocalOperation(filePath, operation, content || '');
-
-    const newVersion = metadata.version + 1;
-    const checksum = content ? this.calculateChecksumFromString(content) : '';
-
-    if (operation === 'UPDATE') {
-      this.metadataService.updateFileMetadata(filePath, {
-        version: newVersion,
-        checksum,
-        lastUpdated: new Date(),
-        size: content?.length || 0
+    // 1. Store chunk temporarily
+    if (!this.chunkBuffers.has(filename)) {
+      this.chunkBuffers.set(filename, {
+        chunks: Array(totalChunks),
+        totalChunks,
+        checksums: []
       });
     }
 
-    await this.sendToReplicas(filePath, operation, content || '', newVersion, checksum);
-    if (operation === 'DELETE') {
-      await this.metadataService.deleteFileMetadata(filePath);
-    }
-    return { newVersion, checksum };
-  }
+    const fileData = this.chunkBuffers.get(filename)!;
+    fileData.chunks[chunkNumber] = chunk;
+    fileData.checksums.push(checksum);
 
+    // 2. Save chunk to local storage
+    const nodePath = path.join(this.storagePath, this.currentNodeId);
+    await fs.mkdir(nodePath, { recursive: true });
 
-  private async processLocalOperation(
-    filePath: string,
-    operation: 'CREATE' | 'UPDATE' | 'DELETE',
-    content: string
-  ) {
-    try {
-      switch (operation) {
-        case 'CREATE':
-          await this.fileServer.createFile({
-            filename: filePath,
-            content
-          });
-          break;
-        case 'UPDATE':
-          this.fileServer.writeFile({
-            filename: filePath,
-            content
-          });
-          break;
-        case 'DELETE':
-          await this.fileServer.deleteFile({
-            filename: filePath
-          });
-          break;
+    const tempPath = path.join(nodePath, `${filename}.part`);
+    await fs.appendFile(tempPath, chunk);
+
+    // 3. If last chunk, finalize file
+    if (chunkNumber === totalChunks - 1) {
+      const finalPath = path.join(nodePath, filename);
+      await fs.rename(tempPath, finalPath);
+
+      // Update metadata if primary node
+      if (this.isPrimaryNode) {
+        const content = await fs.readFile(finalPath, 'utf-8');
+        const fileChecksum = this.calculateChecksumFromString(content);
+
+        const existing = this.metadataService.getFileMetadata(filename);
+        if (!existing) {
+          await this.metadataService.registerFile(filename, this.currentNodeId, targetNodes);
+        }
+
+        await this.metadataService.updateFileMetadata(filename, {
+          version: (existing?.version || 0) + 1,
+          checksum: fileChecksum,
+          lastUpdated: new Date(),
+          size: content.length
+        });
       }
-    } catch (err) {
-      console.error(`Falha ao processar operação ${operation} para ${filePath}:`, err);
-      throw err;
+
+      this.chunkBuffers.delete(filename);
     }
   }
 
-  public async sendToReplicas(
-    filePath: string,
-    operation: 'CREATE' | 'UPDATE' | 'DELETE',
-    content: string,
-    version: number,
-    checksum: string,
-    targetNodesOverride?: string[]
-  ) {
-    const metadata = this.metadataService.getFileMetadata(filePath);
-    if (!metadata) return;
+  private async verifyReplicaIntegrity(): Promise<void> {
+    if (!this.isStorageNode) return;
 
-    const targets = (targetNodesOverride ?? metadata.replicaNodes)
-      .filter(node => this.isStorageNodeId(node) && node !== this.currentNodeId);
+    for (const file of this.metadataService.getAllFiles()) {
+      const meta = this.metadataService.getFileMetadata(file);
+      if (!meta) continue;
 
-    if (!targets.length) return;
+      const isPrimary = meta.primaryNode === this.currentNodeId;
+      const isReplica = meta.replicaNodes.includes(this.currentNodeId);
 
-    await this.pubSub.publish('replication_requests', {
-      event_type: 'REPLICATION_REQUEST',
-      file_path: filePath,
+      if (!isPrimary && !isReplica) continue;
+
+      const filePath = path.join(this.storagePath, this.currentNodeId, file);
+
+      try {
+        if (!existsSync(filePath)) {
+          if (isPrimary) {
+            await this.recoverPrimaryFile(file, meta);
+          } else {
+            await this.recoverReplicaFile(file, meta);
+          }
+          continue;
+        }
+
+        const localChecksum = this.calculateChecksum(filePath);
+
+        if (isPrimary) {
+          await this.verifyPrimaryReplicas(file, meta, localChecksum);
+        } else {
+          await this.verifyReplicaAgainstPrimary(file, meta, localChecksum);
+        }
+      } catch (err) {
+        console.error(`[INTEGRITY] Erro verificando ${file}:`, err);
+      }
+    }
+  }
+
+  private async recoverPrimaryFile(filename: string, meta: FileMetadata) {
+    const replicaWithFile = meta.replicaNodes.find(async node => {
+      try {
+        await this.requestChecksum(node, filename);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+    if (replicaWithFile) {
+      await this.replicateFileFromNode(filename, replicaWithFile);
+    } else {
+      await this.metadataService.deleteFileMetadata(filename);
+    }
+  }
+
+  private async recoverReplicaFile(filename: string, meta: FileMetadata) {
+    try {
+      await this.requestChecksum(meta.primaryNode, filename);
+      await this.replicateFileFromNode(filename, meta.primaryNode);
+    } catch {
+      await fs.unlink(path.join(this.storagePath, this.currentNodeId, filename)).catch(() => { });
+      await this.metadataService.updateFileMetadata(filename, {
+        replicaNodes: meta.replicaNodes.filter(n => n !== this.currentNodeId)
+      });
+    }
+  }
+
+  private async verifyPrimaryReplicas(filename: string, meta: FileMetadata, primaryChecksum: string) {
+    for (const replica of meta.replicaNodes) {
+      if (replica === this.currentNodeId) continue;
+
+      try {
+        const replicaChecksum = await this.requestChecksum(replica, filename);
+        if (replicaChecksum !== primaryChecksum) {
+          await this.replicateFileToNode(filename, replica);
+        }
+      } catch {
+        this.healthyNodes.delete(replica);
+      }
+    }
+  }
+
+  private async verifyReplicaAgainstPrimary(filename: string, meta: FileMetadata, replicaChecksum: string) {
+    try {
+      const primaryChecksum = await this.requestChecksum(meta.primaryNode, filename);
+      if (primaryChecksum !== replicaChecksum) {
+        await this.replicateFileFromNode(filename, meta.primaryNode);
+      }
+    } catch {
+      console.log(`[INTEGRITY] Primário inacessível para ${filename}`);
+    }
+  }
+
+  private async replicateFileFromNode(filename: string, sourceNode: string) {
+    const requestId = crypto.randomUUID();
+    const responseChannel = `file_read_responses:${requestId}`;
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pubSub.unsubscribe(responseChannel);
+        reject(new Error('Timeout ao recuperar arquivo'));
+      }, REPLICATION_TIMEOUT);
+
+      this.pubSub.subscribe(responseChannel, async (msg: Notification) => {
+        clearTimeout(timeout);
+        this.pubSub.unsubscribe(responseChannel);
+
+        try {
+          const { content, error } = JSON.parse(msg.additional_info || '{}');
+          if (error) throw new Error(error);
+
+          const nodePath = path.join(this.storagePath, this.currentNodeId);
+          await fs.mkdir(nodePath, { recursive: true });
+          await fs.writeFile(path.join(nodePath, filename), content);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      this.pubSub.publish('file_read_requests', {
+        event_type: 'FILE_READ_REQUEST',
+        file_path: filename,
+        timestamp: Date.now(),
+        additional_info: JSON.stringify({ requestId, targetNode: sourceNode })
+      });
+    });
+  }
+
+  private async replicateFileToNode(filename: string, targetNode: string) {
+    const filePath = path.join(this.storagePath, this.currentNodeId, filename);
+    const content = await fs.readFile(filePath, 'utf-8');
+    const checksum = this.calculateChecksumFromString(content);
+    const meta = this.metadataService.getFileMetadata(filename);
+
+    await this.pubSub.publish('chunk_store', {
+      event_type: 'CHUNK_STORE',
+      file_path: filename,
       timestamp: Date.now(),
       additional_info: JSON.stringify({
-        operation,
-        content,
-        version,
+        filename,
+        chunk_base64: Buffer.from(content).toString('base64'),
+        chunkNumber: 0,
+        totalChunks: 1,
         checksum,
-        sourceNode: this.currentNodeId,
-        targetNodes: targets
+        targetNodes: [targetNode]
       })
     });
   }
 
-  private async handleReplicationRequest(msg: Notification) {
-    const { operation, content, version, checksum, sourceNode, targetNodes } =
-      JSON.parse(msg.additional_info as string);
-
-    console.log(`Recebendo replicação: ${msg.file_path} de ${sourceNode} para ${targetNodes.join(', ')}`);
-    console.log(`Operação: ${operation}, Versão: ${version}, Checksum: ${checksum}`);
-
-    // Ignorar mensagens não destinadas a este nó
-    if (sourceNode === this.currentNodeId || !targetNodes.includes(this.currentNodeId)) {
-      return;
-    }
-
-    const filePath = msg.file_path;
-    try {
-      await this.processLocalOperation(filePath, operation as any, content);
-
-      if (operation !== 'DELETE') {
-        if (!this.metadataService.getFileMetadata(filePath))
-          await this.metadataService.registerFile(filePath, sourceNode, []);
-
-        await this.metadataService.updateFileMetadata(filePath, {
-          version, checksum, lastUpdated: new Date(),
-          size: operation === 'DELETE' ? 0 : content.length
-        });
-      }
-    } catch (err) {
-      console.error(`Falha ao processar replicação para ${filePath}:`, err);
-    }
-  }
-
-  private async requestChecksum(nodeId: string, filePath: string): Promise<string> {
+  private async requestChecksum(nodeId: string, filename: string): Promise<string> {
     if (nodeId === this.currentNodeId) {
-      return this.calculateChecksum(this.getFilePath(filePath));
+      const filePath = path.join(this.storagePath, this.currentNodeId, filename);
+      return this.calculateChecksum(filePath);
     }
 
     const requestId = crypto.randomUUID();
     const responseChannel = `checksum_responses:${requestId}`;
 
-    return new Promise<string>((res, rej) => {
-      const t = setTimeout(() => {
-        this.pubSub.unsubscribe(responseChannel); rej(new Error('Timeout checksum'));
+    return new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pubSub.unsubscribe(responseChannel);
+        reject(new Error('Timeout ao verificar checksum'));
       }, REPLICATION_TIMEOUT);
 
-      this.pubSub.subscribe(responseChannel, (m: Notification) => {
-        clearTimeout(t);
+      this.pubSub.subscribe(responseChannel, (msg: Notification) => {
+        clearTimeout(timeout);
         this.pubSub.unsubscribe(responseChannel);
-        res(JSON.parse(m.additional_info!).checksum);
+        const { checksum, error } = JSON.parse(msg.additional_info || '{}');
+        error ? reject(new Error(error)) : resolve(checksum);
       });
 
       this.pubSub.publish('checksum_requests', {
         event_type: 'CHECKSUM_REQUEST',
-        file_path: filePath,
+        file_path: filename,
         timestamp: Date.now(),
-        additional_info: JSON.stringify({ targetNode: nodeId, requestId })
+        additional_info: JSON.stringify({ requestId, targetNode: nodeId })
       });
     });
-  }
-
-  private async handleChecksumRequest(msg: Notification) {
-    const { sourceNode, targetNode, requestId } = JSON.parse(msg.additional_info || '{}');
-    const filePath = msg.file_path;
-
-    if (targetNode !== this.currentNodeId) return;
-
-    try {
-      const checksum = this.calculateChecksum(this.getFilePath(filePath));
-
-      await this.pubSub.publish(`checksum_responses:${requestId}`, {
-        event_type: 'CHECKSUM_RESPONSE',
-        file_path: filePath,
-        timestamp: Date.now(),
-        additional_info: JSON.stringify({ checksum })
-      });
-    } catch (err) {
-      console.error(`Erro ao responder checksum de ${filePath} para ${sourceNode}:`, err);
-    }
-  }
-
-  private async verifyReplicaIntegrity(): Promise<void> {
-    // Verifica apenas se este processo é nó de armazenamento
-    if (!this.isStorageNode) return;
-
-    console.log('[INTEGRITY] Iniciando verificação de integridade...');
-
-    try {
-      // 1. Verificar arquivos onde este nó é primário
-      const filesAsPrimary = this.metadataService.getAllFiles()
-        .filter(f => {
-          const meta = this.metadataService.getFileMetadata(f);
-          return meta?.primaryNode === this.currentNodeId;
-        });
-
-      for (const file of filesAsPrimary) {
-        await this.verifyFileIntegrity(file, true);
-      }
-
-      // 2. Verificar arquivos onde este nó é réplica
-      const filesAsReplica = this.metadataService.getAllFiles()
-        .filter(f => {
-          const meta = this.metadataService.getFileMetadata(f);
-          return meta?.replicaNodes.includes(this.currentNodeId) &&
-            meta.primaryNode !== this.currentNodeId;
-        });
-
-      for (const file of filesAsReplica) {
-        await this.verifyFileIntegrity(file, false);
-      }
-    } catch (err) {
-      console.error('[INTEGRITY] Erro durante verificação:', err);
-    }
-  }
-
-  private async verifyFileIntegrity(filename: string, isPrimary: boolean): Promise<void> {
-    const metadata = this.metadataService.getFileMetadata(filename);
-    if (!metadata) return;
-
-    const localPath = this.getFilePath(filename);
-
-    try {
-      // Verificar se arquivo existe localmente
-      if (!existsSync(localPath)) {
-        if (isPrimary) {
-          // Se é primário e não tem o arquivo, verificar se réplicas têm
-          const replicaWithFile = await this.findReplicaWithFile(filename);
-          if (replicaWithFile) {
-            console.log(`[INTEGRITY] Primário sem arquivo ${filename}, recuperando de réplica ${replicaWithFile}`);
-            await this.recoverFileFromReplica(filename, replicaWithFile);
-          } else {
-            console.log(`[INTEGRITY] Arquivo ${filename} não existe em nenhum nó, removendo metadados`);
-            await this.metadataService.deleteFileMetadata(filename);
-          }
-        } else {
-          // Se é réplica e não tem o arquivo, verificar se primário tem
-          if (await this.checkIfPrimaryHasFile(filename)) {
-            console.log(`[INTEGRITY] Réplica sem arquivo ${filename}, recuperando do primário`);
-            await this.replicateToNode(filename, this.currentNodeId);
-          } else {
-            console.log(`[INTEGRITY] Arquivo ${filename} não existe no primário, removendo localmente`);
-            await this.fileServer.deleteFile({ filename });
-            await this.metadataService.updateFileMetadata(filename, {
-              replicaNodes: metadata.replicaNodes.filter(n => n !== this.currentNodeId)
-            });
-          }
-        }
-        return;
-      }
-
-      // Verificar checksum local
-      const localChecksum = this.calculateChecksum(localPath);
-
-      if (isPrimary) {
-        // Verificar réplicas
-        for (const replica of metadata.replicaNodes) {
-          if (replica === this.currentNodeId) continue;
-
-          try {
-            const replicaChecksum = await this.requestChecksum(replica, filename);
-            if (replicaChecksum !== localChecksum) {
-              console.log(`[INTEGRITY] Réplica ${replica} fora de sincronia para ${filename}, replicando...`);
-              await this.replicateToNode(filename, replica);
-            }
-          } catch (err) {
-            console.log(`[INTEGRITY] Réplica ${replica} inacessível para ${filename}`);
-            this.healthyNodes.delete(replica);
-          }
-        }
-      } else {
-        // Verificar contra primário
-        try {
-          const primaryChecksum = await this.requestChecksum(metadata.primaryNode, filename);
-          if (primaryChecksum !== localChecksum) {
-            console.log(`[INTEGRITY] Réplica fora de sincronia com primário para ${filename}, atualizando...`);
-            await this.replicateToNode(filename, this.currentNodeId);
-          }
-        } catch (err) {
-          console.log(`[INTEGRITY] Primário inacessível para ${filename}`);
-        }
-      }
-    } catch (err) {
-      console.error(`[INTEGRITY] Erro ao verificar integridade de ${filename}:`, err);
-    }
-  }
-
-  private async findReplicaWithFile(filename: string): Promise<string | null> {
-    const metadata = this.metadataService.getFileMetadata(filename);
-    if (!metadata) return null;
-
-    for (const replica of metadata.replicaNodes) {
-      try {
-        await this.requestChecksum(replica, filename);
-        return replica;
-      } catch {
-        continue;
-      }
-    }
-    return null;
-  }
-
-  private async checkIfPrimaryHasFile(filename: string): Promise<boolean> {
-    const metadata = this.metadataService.getFileMetadata(filename);
-    if (!metadata) return false;
-
-    try {
-      await this.requestChecksum(metadata.primaryNode, filename);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async recoverFileFromReplica(filename: string, sourceNode: string): Promise<void> {
-    try {
-      const { content } = await this.fileServer.readFileWithFallback({
-        filename,
-        preferredNode: sourceNode,
-        replicaNodes: []
-      });
-
-      if (content) {
-        await this.fileServer.createFile({ filename, content });
-        console.log(`[INTEGRITY] Arquivo ${filename} recuperado de ${sourceNode}`);
-      }
-    } catch (err) {
-      console.error(`[INTEGRITY] Falha ao recuperar arquivo ${filename} de ${sourceNode}:`, err);
-    }
-  }
-
-  private async syncFilesToNewNode(newNodeId: string): Promise<void> {
-    if (!this.isStorageNodeId(newNodeId)) return;
-
-    /* envia arquivos válidos */
-    for (const file of this.metadataService.getAllFiles()) {
-      const meta = this.metadataService.getFileMetadata(file)!;
-      if (meta.replicaNodes.includes(newNodeId)) continue;        // já é réplica
-
-      const { content } = await this.fileServer.readFileWithFallback({
-        filename: file,
-        preferredNode: meta.primaryNode,
-        replicaNodes: meta.replicaNodes
-      });
-
-      if (!content) continue;
-
-      await this.sendToReplicas(
-        file, 'CREATE', content, meta.version,
-        this.calculateChecksumFromString(content), [newNodeId]
-      );
-
-      await this.metadataService.updateFileMetadata(file, {
-        replicaNodes: [...meta.replicaNodes, newNodeId],
-        lastUpdated: new Date()
-      });
-    }
-  }
-
-  private async replicateToNode(filePath: string, targetNode: string): Promise<void> {
-    if (!this.isStorageNodeId(targetNode)) return;
-
-    const content = readFileSync(this.getFilePath(filePath), 'utf-8');
-    const meta = this.metadataService.getFileMetadata(filePath);
-    if (!meta) return;
-
-    await this.sendToReplicas(
-      filePath, 'UPDATE', content, meta.version,
-      this.calculateChecksumFromString(content), [targetNode]
-    );
-  }
-
-  public async handleIncomingChunk(chunk: {
-    filename: string;
-    chunk: Buffer;
-    chunkNumber: number;
-    totalChunks: number;
-    checksum: string;
-    sourceNode: string;
-  }): Promise<void> {
-    console.log(`[CHUNK] Recebendo pedaço ${chunk.chunkNumber + 1}/${chunk.totalChunks} de ${chunk.sourceNode} para ${chunk.filename}`);
-
-    // 1. Armazenar o chunk temporariamente
-    if (!this.chunkBuffers.has(chunk.filename)) {
-      this.chunkBuffers.set(chunk.filename, {
-        chunks: Array(chunk.totalChunks),
-        totalChunks: chunk.totalChunks,
-        checksums: []
-      });
-    }
-
-    const fileData = this.chunkBuffers.get(chunk.filename)!;
-    fileData.chunks[chunk.chunkNumber] = chunk.chunk;
-    fileData.checksums.push(chunk.checksum);
-
-    // 2. Salvar localmente
-    await this.fileServer.handleFileChunk(chunk);
-
-    // 4. Se for o último chunk, finalizar o processo
-    const isLastChunk = chunk.chunkNumber === chunk.totalChunks - 1;
-    if (isLastChunk) {
-      console.log(`[CHUNK] ${chunk.filename} completo. Finalizando processo...`);
-
-      const fullPath = this.getFilePath(chunk.filename);
-      const content = await fs.readFile(fullPath, 'utf-8');
-      const checksum = this.calculateChecksumFromString(content);
-
-      if (process.env.IS_PRIMARY_NODE === 'true') {
-        // Se for o primário, atualizar metadados
-        const existing = this.metadataService.getFileMetadata(chunk.filename);
-        if (!existing) {
-          const replicas = this.metadataService.findNewReplicaCandidates([this.currentNodeId]);
-          await this.metadataService.registerFile(chunk.filename, this.currentNodeId, replicas);
-        }
-        await this.metadataService.updateFileMetadata(chunk.filename, {
-          version: 1,
-          checksum,
-          lastUpdated: new Date(),
-          size: content.length
-        });
-
-        for (let i = 0; i < fileData.totalChunks; i++) {
-          await this.replicateChunk({
-            filename: chunk.filename,
-            chunk: fileData.chunks[i],
-            chunkNumber: i,
-            totalChunks: fileData.totalChunks,
-            checksum: fileData.checksums[i],
-            sourceNode: this.currentNodeId
-          });
-        }
-      }
-      this.chunkBuffers.delete(chunk.filename);
-    }
-  }
-
-  private async replicateChunk(chunk: {
-    filename: string;
-    chunk: Buffer;
-    chunkNumber: number;
-    totalChunks: number;
-    checksum: string;
-    sourceNode: string;
-  }): Promise<void> {
-    const metadata = this.metadataService.getFileMetadata(chunk.filename);
-    if (!metadata) return;
-
-    const targetNodes = metadata.replicaNodes
-      .filter(node => node !== this.currentNodeId && this.healthyNodes.has(node));
-
-    if (targetNodes.length === 0) return;
-
-    console.log(`[CHUNK] Replicando chunk ${chunk.chunkNumber + 1}/${chunk.totalChunks} para ${targetNodes.join(', ')}`);
-
-    await this.pubSub.publish('chunk_replication', {
-      event_type: 'CHUNK_REPLICATION',
-      file_path: chunk.filename,
-      timestamp: Date.now(),
-      additional_info: JSON.stringify({
-        filename: chunk.filename,
-        chunk: chunk.chunk.toString('base64'),
-        chunkNumber: chunk.chunkNumber,
-        totalChunks: chunk.totalChunks,
-        checksum: chunk.checksum,
-        sourceNode: this.currentNodeId,
-        targetNodes
-      })
-    });
-  }
-
-  private async getAllFilesRecursively(basePath: string): Promise<{ name: string, is_directory: boolean }[]> {
-    const results: { name: string, is_directory: boolean }[] = [];
-
-    const walk = async (dir: string, prefix = '') => {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-
-      for (const entry of entries) {
-        const relPath = path.join(prefix, entry.name);
-        results.push({ name: relPath, is_directory: entry.isDirectory() });
-
-        if (entry.isDirectory()) {
-          await walk(path.join(dir, entry.name), relPath);
-        }
-      }
-    };
-
-    await walk(basePath);
-    return results;
-  }
-
-  /* ---------- UTIL ---------- */
-
-  private getFilePath(filePath: string): string {
-    return join(this.storagePath, this.currentNodeId, filePath);
   }
 
   private calculateChecksum(filePath: string): string {
-    return this.calculateChecksumFromString(readFileSync(filePath, 'utf-8'));
+    const content = readFileSync(filePath, 'utf-8');
+    return this.calculateChecksumFromString(content);
   }
 
-  public calculateChecksumFromString(content: string): string {
+  private calculateChecksumFromString(content: string): string {
     return crypto.createHash('sha256').update(content).digest('hex');
   }
 
@@ -784,14 +583,27 @@ export class ReplicationService {
   }
 
   private getStorageUsed(): number {
-    const files = this.metadataService.getAllFiles();
+    const nodePath = path.join(this.storagePath, this.currentNodeId);
+    if (!existsSync(nodePath)) return 0;
+
+    const files = readdirSync(nodePath, { recursive: true, encoding: 'utf-8' });
     return files.reduce((total, file) => {
-      const metadata = this.metadataService.getFileMetadata(file);
-      return total + (metadata?.size || 0);
+      try {
+        const filePath = path.join(nodePath, file.toString());
+        const stats = statSync(filePath);
+        return stats.isFile() ? total + stats.size : total;
+      } catch (err) {
+        console.error(`Error getting stats for ${file}:`, err);
+        return total;
+      }
     }, 0);
   }
 
-  private isStorageNodeId(id: string) {
-    return id !== 'server' && this.healthyNodes.has(id);
+  public get currentNodeId(): string {
+    return process.env.NODE_ID || 'server';
+  }
+
+  private get isPrimaryNode(): boolean {
+    return process.env.IS_PRIMARY_NODE === 'true';
   }
 }

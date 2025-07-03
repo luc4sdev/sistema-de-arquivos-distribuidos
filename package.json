@@ -11,6 +11,7 @@
     "dev:node1": "cross-env IS_PRIMARY_NODE=true IS_STORAGE_NODE=true NODE_ID=node1 PORT=50051 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
     "dev:node2": "cross-env IS_STORAGE_NODE=true NODE_ID=node2 PORT=50052 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
     "dev:node3": "cross-env IS_STORAGE_NODE=true NODE_ID=node3 PORT=50053 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
+    "dev:node4": "cross-env IS_STORAGE_NODE=true NODE_ID=node4 PORT=50054 ENABLE_HEARTBEAT=true STORAGE_PATH=./nodes ts-node src/start-node.ts",
     "dev:test": "ts-node src/client/testFiles.ts",
     "dev:test:concurrency": "ts-node src/client/testConcurrencyFiles.ts"
   },

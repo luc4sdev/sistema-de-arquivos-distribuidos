@@ -2,15 +2,23 @@ export interface FileOperationResponse {
     status: 'success' | 'error';
     message?: string;
     content?: string;
-    timeMs?: number;
     files?: Array<{
         name: string;
         isDirectory: boolean;
+        size?: number;
+        modified?: Date;
     }>;
-    filename?: string;
-    node?: string; // ID do nó onde a operação foi realizada
+    node?: string;
+    time_ms?: number;
 }
 
+export interface FileChunkData {
+    filename: string;
+    chunk: Buffer;
+    chunkNumber: number;
+    totalChunks: number;
+    checksum: string;
+}
 export interface ListFilesPayload {
     path?: string;  // Caminho relativo ao diretório base
 }
@@ -69,7 +77,8 @@ export interface PerformanceMetrics {
 export type EventType = 'CREATE' | 'DELETE' | 'UPDATE'
     | 'NODE_HEARTBEAT' | 'REPLICATION_REQUEST' | 'CHECKSUM_REQUEST'
     | 'CHECKSUM_RESPONSE' | 'NODE_JOIN' | 'FILE_OPERATION' | 'CHUNK_REPLICATION' | 'FILE_CHUNK'
-    | 'FILE_READ_REQUEST' | 'FILE_READ_RESPONSE' | 'FILE_LIST_REQUEST' | 'FILE_LIST_RESPONSE';
+    | 'FILE_READ_REQUEST' | 'FILE_READ_RESPONSE' | 'FILE_LIST_REQUEST' | 'FILE_LIST_RESPONSE' | 'CHUNK_STORE'
+    | 'DELETE_REQUEST' | 'CHUNK_REQUEST' | 'CHUNK_RESPONSE';
 
 
 export interface Notification {
@@ -97,6 +106,7 @@ export interface FileMetadata {
     lastUpdated: Date;
     checksum: string;
     size: number;
+    chunkDistribution?: Record<number, string[]>
 }
 
 export interface ReplicationLog {

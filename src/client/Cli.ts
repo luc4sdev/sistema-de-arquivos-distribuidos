@@ -23,7 +23,7 @@ export class Cli {
         console.log('  write <nome> <conteúdo>  - Atualiza um arquivo');
         console.log('  delete <nome>            - Remove um arquivo');
         console.log('  list [path]              - Lista arquivos');
-        //console.log('  download <remoto> [local]- Baixa um arquivo');
+        console.log('  download <remoto> [local]- Baixa um arquivo');
         console.log('  upload <local> <remoto> - Envia um arquivo grande em chunks');
         console.log('  exit                     - Sai do programa');
 

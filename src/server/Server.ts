@@ -11,8 +11,10 @@ import { MetadataService } from './metadataService';
 import { SubscriptionService } from '../redis/SubscriptionService';
 import { readFileSync } from 'fs';
 import * as crypto from 'crypto';
+import * as fs from 'fs/promises';
 
 const PROTO_PATH = path.join(__dirname, '../proto/filesystem.proto');
+const CHUNK_SIZE = 1024 * 1024; // 1 MB 
 
 export class GRPCServer {
     private server: grpc.Server;
@@ -21,7 +23,27 @@ export class GRPCServer {
     private pubSub: RedisPubSub;
     private replicationService: ReplicationService;
     private metadataService: MetadataService;
+    private benchmarkResults: {
+        upload: {
+            fileSize: number;
+            timeMs: number;
+            speed: number;
+            cpuUsage: number;  // Adicionado
+            memoryUsage: number;  // Adicionado
+        }[];
+        download: {
+            fileSize: number;
+            timeMs: number;
+            speed: number;
+            cpuUsage: number;  // Adicionado
+            memoryUsage: number;  // Adicionado
+        }[];
+    } = {
+            upload: [],
+            download: []
+        };
 
+    private benchmarkActive = false;
     constructor(
         private port: number = parseInt(process.env.PORT || '50050'),
         private storagePath: string = process.env.STORAGE_PATH || './nodes'
@@ -55,8 +77,7 @@ export class GRPCServer {
             ReadFile: this.wrapWithMetrics(this.readFile.bind(this), 'read'),
             WriteFile: this.wrapWithMetrics(this.writeFile.bind(this), 'write'),
             DeleteFile: this.wrapWithMetrics(this.deleteFile.bind(this), 'delete'),
-            CopyFile: this.wrapWithMetrics(this.copyFile.bind(this), 'copy'),
-            DownloadFile: this.wrapWithMetrics(this.downloadFile.bind(this), 'download'),
+            DownloadFile: this.downloadFileChunks.bind(this),
             UploadFile: this.handleUploadFile.bind(this),
             ListFiles: this.listFiles.bind(this),
             Subscribe: this.subscribe.bind(this)
@@ -145,37 +166,6 @@ export class GRPCServer {
         }
     }
 
-    private async copyFile(call: any): Promise<any> {
-        const { source, destination } = call.request;
-        const localFilePath = join(__dirname, '..', '..', 'localFiles', source);
-
-        try {
-            // Verificar se destino já existe
-            if (this.metadataService.getFileMetadata(destination)) {
-                throw new Error(`Arquivo ${destination} já existe`);
-            }
-
-            const sourceContent = readFileSync(localFilePath, 'utf-8');
-
-            // Criar cópia com replicação
-            await this.pubSub.publish('file_operations', {
-                event_type: 'FILE_OPERATION',
-                file_path: destination,
-                timestamp: Date.now(),
-                additional_info: JSON.stringify({
-                    operation: 'CREATE',
-                    content: sourceContent,
-                })
-            });
-            return {
-                status: 'success',
-            };
-        } catch (err) {
-            console.error(`Erro ao copiar ${source} para ${destination}:`, err);
-            throw err;
-        }
-    }
-
     private async readFile(call: any): Promise<any> {
         const { filename } = call.request;
         await this.metadataService.loadAllMetadataFromRedis();
@@ -243,104 +233,201 @@ export class GRPCServer {
     }
 
 
-    private async downloadFile(call: any): Promise<any> {
-        const { path, output_name } = call.request;
-
-        try {
-            const metadata = this.metadataService.getFileMetadata(path);
-            if (!metadata) {
-                throw new Error(`Arquivo ${path} não encontrado`);
-            }
-
-            const result = await this.fileServer.downloadFileWithFallback({
-                remotePath: path,
-                outputName: output_name,
-                preferredNode: metadata.primaryNode,
-                replicaNodes: metadata.replicaNodes
-            });
-
-            return result;
-        } catch (err) {
-            console.error(`Erro ao baixar arquivo ${path}:`, err);
-            throw err;
-        }
-    }
-
-    private async handleUploadFile(call: grpc.ServerReadableStream<any, any>, callback: any) {
+    private handleUploadFile(
+        call: grpc.ServerReadableStream<any, any>,
+        cb: grpc.sendUnaryData<any>
+    ) {
         let filename = '';
         let totalChunks = 0;
         let receivedChunks = 0;
-        const start = Date.now();
-        call.on('data', async (chunk: any) => {
+        const chunkDistribution: Record<number, string[]> = {};
+        const pendingOperations: Promise<void>[] = [];
+        let hasError = false;
+
+        // 1. Configuração do timeout para detectar stalls
+        const operationTimeout = setTimeout(() => {
+            if (!hasError && receivedChunks < totalChunks) {
+                const err = new Error(`Timeout: apenas ${receivedChunks}/${totalChunks} chunks recebidos`);
+                console.error(err.message);
+                call.destroy(err);
+            }
+        }, 30000); // 30 segundos de timeout
+
+        call.on('data', (chunkMsg: any) => {
+            if (hasError) return;
+
             try {
                 if (!filename) {
-                    filename = chunk.filename;
-                    totalChunks = chunk.total_chunks;
-                }
-
-                // Verificar checksum do chunk
-                const calculatedChecksum = crypto.createHash('sha256')
-                    .update(chunk.chunk)
-                    .digest('hex');
-
-                if (calculatedChecksum !== chunk.checksum) {
-                    throw new Error(`Checksum inválido para chunk ${chunk.chunk_number}`);
+                    filename = chunkMsg.filename;
+                    totalChunks = chunkMsg.total_chunks;
                 }
 
                 receivedChunks++;
-                console.log(`Enviando chunk ${chunk.chunk_number + 1}/${chunk.total_chunks} para o primário via Redis`);
+                const chunkNumber = chunkMsg.chunk_number;
 
-                // Publica o chunk no Redis
-                await this.pubSub.publish('file_chunks', {
-                    event_type: 'FILE_CHUNK',
-                    file_path: filename,
-                    timestamp: Date.now(),
-                    additional_info: JSON.stringify({
-                        filename: filename,
-                        chunk: Buffer.from(chunk.chunk).toString('base64'), // Serializa para string
-                        chunkNumber: chunk.chunk_number,
-                        totalChunks: chunk.total_chunks,
-                        checksum: chunk.checksum,
-                        sourceNode: this.replicationService.currentNodeId
-                    })
-                });
+                // 2. Processamento assíncrono com controle de concorrência
+                const processPromise = (async () => {
+                    try {
+                        await this.metadataService.loadAllFromRedis();
+                        const availableNodes = this.metadataService.getAvailableNodes();
 
-            } catch (err) {
-                console.error('Erro ao processar chunk:', err);
-                call.destroy(err as Error);
+                        if (availableNodes.length < 2) {
+                            throw new Error('Nós insuficientes para replicação');
+                        }
+
+                        const primaryNode = availableNodes[chunkNumber % availableNodes.length];
+                        const replicaNode = availableNodes[(chunkNumber + 1) % availableNodes.length];
+                        const targetNodes = [primaryNode, replicaNode];
+
+                        // 3. Armazena distribuição ANTES de enviar para evitar race condition
+                        chunkDistribution[chunkNumber] = targetNodes;
+
+                        // 4. Envio paralelo com tratamento de erro
+                        await Promise.all(
+                            targetNodes.map(targetNode =>
+                                this.pubSub.publish(`chunk_node_${targetNode}`, {
+                                    event_type: 'CHUNK_STORE',
+                                    file_path: filename,
+                                    timestamp: Date.now(),
+                                    additional_info: JSON.stringify({
+                                        filename,
+                                        chunk_base64: Buffer.from(chunkMsg.chunk).toString('base64'),
+                                        chunkNumber,
+                                        totalChunks,
+                                        checksum: chunkMsg.checksum,
+                                        isReplica: targetNode !== primaryNode
+                                    })
+                                }).catch(err => {
+                                    console.error(`Erro ao publicar para ${targetNode}:`, err);
+                                    throw err;
+                                })
+                            )
+                        );
+                    } catch (e) {
+                        hasError = true;
+                        throw e;
+                    }
+                })();
+
+                pendingOperations.push(processPromise);
+            } catch (e) {
+                hasError = true;
+                console.error('Erro no processamento do chunk:', e);
+                call.destroy(e as Error);
             }
         });
 
         call.on('end', async () => {
+            clearTimeout(operationTimeout);
+
             try {
-                if (receivedChunks !== totalChunks) {
-                    throw new Error(`Faltam chunks. Recebidos: ${receivedChunks}, Esperados: ${totalChunks}`);
+                // 5. Espera TODAS as operações concluírem
+                await Promise.all(pendingOperations);
+
+                if (hasError) {
+                    throw new Error('Operação cancelada devido a erros anteriores');
                 }
 
-                console.log(`Todos os chunks (${totalChunks}) foram enviados via Redis para o nó primário.`);
-                const time_ms = Date.now() - start;  // calcula o tempo decorrido
-                callback(null, {
+                // 6. Verificação final de integridade
+                if (Object.keys(chunkDistribution).length !== totalChunks) {
+                    throw new Error(
+                        `Chunks incompletos. Recebidos: ${Object.keys(chunkDistribution).length}, Esperados: ${totalChunks}`
+                    );
+                }
+
+                console.log(`Todos os ${totalChunks} chunks processados com sucesso`);
+
+                // 7. Registro de metadados
+                await this.metadataService.registerFile(
+                    filename,
+                    'DISTRIBUTED',
+                    [],
+                    chunkDistribution
+                );
+
+                cb(null, {
                     status: 'success',
-                    time_ms,
-                    message: 'Chunks enviados com sucesso para o primário via Redis'
+                    message: `${receivedChunks}/${totalChunks} chunks recebidos e distribuídos`,
+                    chunkDistribution,
+                    receivedChunks: receivedChunks,
+                    totalChunks: totalChunks
                 });
             } catch (err) {
-                console.error('Erro ao finalizar envio de chunks:', err);
-                callback({
+                console.error('Erro no processamento final:', err);
+                cb({
                     code: grpc.status.INTERNAL,
-                    message: (err as Error).message
+                    message: `Erro ao registrar metadados: ${(err as Error).message}`
                 });
             }
         });
 
-        call.on('error', (err) => {
-            console.error('Erro no stream de upload:', err);
-            callback({
-                code: grpc.status.INTERNAL,
-                message: 'Erro durante o upload do arquivo'
-            });
+        call.on('error', err => {
+            hasError = true;
+            clearTimeout(operationTimeout);
+            console.error('Erro no upload stream:', err);
+            cb({ code: grpc.status.INTERNAL, message: String(err) });
         });
     }
+
+    private async downloadFileChunks(
+        call: grpc.ServerWritableStream<any, any>
+    ) {
+        const { path: filePath } = call.request;
+
+        try {
+            // Carrega metadados
+            await this.metadataService.loadAllMetadataFromRedis();
+            const meta = this.metadataService.getFileMetadata(filePath);
+
+            if (!meta || !meta.chunkDistribution) {
+                throw new Error('Arquivo não encontrado ou distribuição de chunks indisponível');
+            }
+            console.log(Object.keys(meta.chunkDistribution).length)
+            // Para cada chunk, encontra um nó disponível e recupera
+            for (let chunkNumber = 0; chunkNumber < Object.keys(meta.chunkDistribution).length; chunkNumber++) {
+                const possibleNodes = meta.chunkDistribution[chunkNumber];
+                let chunkData: Buffer | null = null;
+
+                // Tenta cada nó até conseguir o chunk
+                for (const nodeId of possibleNodes) {
+                    try {
+                        const response = await this.replicationService.requestChunkFromNode(nodeId, filePath, chunkNumber);
+                        chunkData = response.chunk;
+                        break;
+                    } catch (err) {
+                        console.warn(`Falha ao obter chunk ${chunkNumber} do nó ${nodeId}:`, err);
+                    }
+                }
+
+                if (!chunkData) {
+                    throw new Error(`Não foi possível recuperar chunk ${chunkNumber}`);
+                }
+
+                if (!meta?.chunkDistribution) {
+                    throw new Error('Distribuição de chunks não disponível');
+                }
+                const totalChunks = Object.keys(meta.chunkDistribution).length;
+                await new Promise<void>((resolve, reject) => {
+                    call.write({
+                        filename: filePath,
+                        chunk_number: chunkNumber,
+                        total_chunks: totalChunks,
+                        chunk: chunkData,
+                        checksum: crypto.createHash('sha256').update(chunkData).digest('hex')
+                    }, (err: any) => err ? reject(err) : resolve());
+                });
+            }
+        } catch (err) {
+            console.error(`Erro durante download de ${filePath}:`, err);
+            call.emit('error', {
+                code: grpc.status.INTERNAL,
+                message: `Falha no download: ${(err as Error).message}`
+            });
+        } finally {
+            call.end();
+        }
+    }
+
 
 
     private listFiles(
@@ -391,6 +478,480 @@ export class GRPCServer {
         }
     }
 
+    private async benchmarkOperation(
+        operation: 'upload' | 'download',
+        fileSizeMB: number,
+        iterations: number = 3
+    ): Promise<void> {
+        if (this.benchmarkActive) return;
+        this.benchmarkActive = true;
+
+        const testFileName = `benchmark_${fileSizeMB}MB.bin`;
+        const testFilePath = path.join(this.storagePath, testFileName);
+
+        try {
+            // 1. Preparação do arquivo de teste com verificação
+            const fileSizeBytes = fileSizeMB * 1024 * 1024;
+            if (!await this.fileExists(testFilePath)) {
+                console.log(`Criando arquivo de teste de ${fileSizeMB}MB...`);
+                const testData = crypto.randomBytes(fileSizeBytes);
+                await fs.writeFile(testFilePath, testData);
+            }
+
+            // Verificar tamanho real do arquivo
+            const stats = await fs.stat(testFilePath);
+            if (stats.size !== fileSizeBytes) {
+                throw new Error(`Tamanho do arquivo incorreto (esperado: ${fileSizeBytes} bytes, atual: ${stats.size} bytes)`);
+            }
+
+            // 2. Configurações de benchmark
+            const results = {
+                speeds: [] as number[],
+                cpuUsages: [] as number[],
+                memoryUsages: [] as number[],
+                timings: [] as number[]
+            };
+
+            // 3. Loop de iterações
+            for (let i = 0; i < iterations; i++) {
+                // Pré-aquecimento e limpeza
+                if (global.gc) global.gc();
+                await new Promise(resolve => setTimeout(resolve, 500));
+
+                // Iniciar monitoramento de recursos
+                const startMemory = process.memoryUsage();
+                const startCpu = process.cpuUsage();
+                const startTime = performance.now();
+
+                // 4. Executar operação com tracking real
+                let bytesTransferred = 0;
+                if (operation === 'upload') {
+                    bytesTransferred = await this.simulateUploadWithTracking(testFileName, testFilePath);
+                } else {
+                    bytesTransferred = await this.simulateDownloadWithTracking(testFileName);
+                }
+
+                // 5. Cálculo das métricas
+                const endTime = performance.now();
+                const elapsedTimeMs = endTime - startTime;
+
+                // Verificação de integridade
+                if (bytesTransferred !== fileSizeBytes) {
+                    throw new Error(`Transferência incompleta (esperado: ${fileSizeBytes} bytes, transferido: ${bytesTransferred} bytes)`);
+                }
+
+                // Cálculo de velocidade real (MB/s)
+                const speedMBps = (fileSizeMB / (elapsedTimeMs / 1000));
+
+                // Cálculo de uso de CPU
+                const cpuUsage = process.cpuUsage(startCpu);
+                const cpuPercentage = ((cpuUsage.user + cpuUsage.system) / 1000) / elapsedTimeMs;
+
+                // Cálculo de memória
+                const endMemory = process.memoryUsage();
+                const memoryUsageMB = (endMemory.heapUsed - startMemory.heapUsed) / (1024 * 1024);
+
+                // Armazenar resultados
+                results.speeds.push(speedMBps);
+                results.cpuUsages.push(Math.max(0, cpuPercentage));
+                results.memoryUsages.push(Math.max(0, memoryUsageMB));
+                results.timings.push(elapsedTimeMs);
+
+                console.log(`Iteração ${i + 1}: ${speedMBps.toFixed(2)} MB/s, CPU: ${cpuPercentage.toFixed(1)}%, Mem: ${memoryUsageMB.toFixed(2)}MB`);
+
+                await new Promise(resolve => setTimeout(resolve, 1000)); // Resfriamento
+            }
+
+            // 6. Cálculo das médias
+            const avgSpeed = results.speeds.reduce((a, b) => a + b, 0) / iterations;
+            const avgCpu = results.cpuUsages.reduce((a, b) => a + b, 0) / iterations;
+            const avgMemory = results.memoryUsages.reduce((a, b) => a + b, 0) / iterations;
+            const avgTime = results.timings.reduce((a, b) => a + b, 0) / iterations;
+
+            // 7. Verificação de sanidade
+            const maxRealisticSpeed = this.getRealisticSpeedLimit(operation);
+            if (avgSpeed > maxRealisticSpeed) {
+                console.warn(`AVISO: Velocidade média (${avgSpeed.toFixed(2)} MB/s) acima do limite realista de ${maxRealisticSpeed} MB/s`);
+            }
+
+            // 8. Armazenar resultados finais
+            this.benchmarkResults[operation].push({
+                fileSize: fileSizeMB,
+                timeMs: avgTime,
+                speed: avgSpeed,
+                cpuUsage: avgCpu,
+                memoryUsage: avgMemory,
+
+            });
+
+            console.log(`\nResultado final ${operation} (${fileSizeMB}MB):
+        Velocidade média: ${avgSpeed.toFixed(2)} MB/s
+        Uso médio de CPU: ${avgCpu.toFixed(1)}%
+        Uso médio de memória: ${avgMemory.toFixed(2)}MB
+        Tempo médio: ${avgTime.toFixed(2)}ms\n`);
+
+        } catch (err) {
+            console.error(`Erro no benchmark de ${operation}:`, err);
+            // Tentar limpar arquivo de teste em caso de erro
+            try { await fs.unlink(testFilePath); } catch { }
+        } finally {
+            this.benchmarkActive = false;
+        }
+    }
+
+    private getRealisticSpeedLimit(operation: string): number {
+        // Limites realistas baseados em hardware típico
+        const limits: Record<string, number> = {
+            upload: 5000,   // 5 GB/s (SSD NVMe rápido)
+            download: 5000  // 5 GB/s (SSD NVMe rápido)
+        };
+        return limits[operation] || 1000; // Fallback conservador
+    }
+
+    private async simulateUploadWithTracking(filename: string, filePath: string): Promise<number> {
+        const fileData = await fs.readFile(filePath);
+        let bytesTransferred = 0;
+
+        await new Promise((resolve, reject) => {
+            const call = this.handleUploadFile({
+                on: (event: any, callback: any) => {
+                    if (event === 'data') {
+                        for (let i = 0; i < Math.ceil(fileData.length / CHUNK_SIZE); i++) {
+                            const chunk = fileData.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                            bytesTransferred += chunk.length;
+                            callback({
+                                filename,
+                                chunk_number: i,
+                                total_chunks: Math.ceil(fileData.length / CHUNK_SIZE),
+                                chunk,
+                                checksum: crypto.createHash('sha256').update(chunk).digest('hex')
+                            });
+                        }
+                    } else if (event === 'end') {
+                        resolve(bytesTransferred);
+                    }
+                }
+            } as any, (err) => err && reject(err));
+        });
+
+        return bytesTransferred;
+    }
+
+    private async simulateDownloadWithTracking(filename: string): Promise<number> {
+        let bytesTransferred = 0;
+
+        await new Promise((resolve, reject) => {
+            const call = this.downloadFileChunks({
+                request: { path: filename },
+                write: (chunk: any) => {
+                    if (!chunk.chunk) {
+                        reject(new Error("Chunk vazio recebido"));
+                        return;
+                    }
+                    bytesTransferred += chunk.chunk.length;
+                },
+                end: () => resolve(bytesTransferred),
+                emit: (event: any, err: any) => event === 'error' && reject(err)
+            } as any);
+        });
+
+        return bytesTransferred;
+    }
+    private async fileExists(filePath: string): Promise<boolean> {
+        try {
+            await fs.access(filePath);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private async simulateUpload(filename: string, filePath: string): Promise<void> {
+        const fileData = await fs.readFile(filePath);
+        const totalChunks = Math.ceil(fileData.length / CHUNK_SIZE);
+
+        return new Promise((resolve, reject) => {
+            const call = this.handleUploadFile({
+                on: (event: string, callback: Function) => {
+                    if (event === 'data') {
+                        // Simular envio de chunks
+                        for (let i = 0; i < totalChunks; i++) {
+                            const start = i * CHUNK_SIZE;
+                            const end = start + CHUNK_SIZE;
+                            const chunk = fileData.slice(start, end);
+
+                            callback({
+                                filename,
+                                chunk_number: i,
+                                total_chunks: totalChunks,
+                                chunk: chunk,
+                                checksum: crypto.createHash('sha256').update(chunk).digest('hex')
+                            });
+                        }
+                    } else if (event === 'end') {
+                        callback();
+                        resolve();
+                    }
+                }
+            } as any, (err: any, res: any) => {
+                if (err) reject(err);
+            });
+        });
+    }
+
+    private async simulateDownload(filename: string): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const call = this.downloadFileChunks({
+                request: { path: filename },
+                write: (chunk: any) => { },
+                end: () => resolve(),
+                emit: (event: string, err: any) => {
+                    if (event === 'error') reject(err);
+                }
+            } as any);
+        });
+    }
+
+    public async runAllBenchmarks() {
+        const sizes = [1, 5, 10, 100]; // Tamanhos em MB
+
+        console.log('Iniciando benchmarks de upload...');
+        for (const size of sizes) {
+            await this.benchmarkOperation('upload', size);
+        }
+
+        console.log('Iniciando benchmarks de download...');
+        for (const size of sizes) {
+            await this.benchmarkOperation('download', size);
+        }
+
+        this.logBenchmarkResults();
+    }
+    private logBenchmarkResults() {
+        console.log('\n=== Resultados dos Benchmarks ===');
+
+        console.log('\nUpload:');
+        console.table(this.benchmarkResults.upload);
+
+        console.log('\nDownload:');
+        console.table(this.benchmarkResults.download);
+
+        this.generateBenchmarkCharts();
+    }
+    private async generateBenchmarkCharts() {
+        try {
+            const { ChartJSNodeCanvas } = await import('chartjs-node-canvas');
+            const width = 1000;
+            const height = 600;
+            const backgroundColour = 'white';
+
+            const chartJSNodeCanvas = new ChartJSNodeCanvas({
+                width,
+                height,
+                backgroundColour
+            });
+
+            // Configuração base para os gráficos
+            const baseChartOptions = {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'top' as const,
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: (context: any) => {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                if (context.parsed.y !== null) {
+                                    label += context.parsed.y.toFixed(2);
+                                    if (context.dataset.label?.includes('Velocidade')) {
+                                        label += ' MB/s';
+                                    } else if (context.dataset.label?.includes('CPU')) {
+                                        label += '%';
+                                    } else if (context.dataset.label?.includes('Memória')) {
+                                        label += ' MB';
+                                    }
+                                }
+                                return label;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            };
+
+            // Gráfico de Velocidade
+            const speedChartConfig = {
+                type: 'bar' as const,
+                data: {
+                    labels: this.benchmarkResults.upload.map(r => `${r.fileSize}MB`),
+                    datasets: [
+                        {
+                            label: 'Upload - Velocidade (MB/s)',
+                            data: this.benchmarkResults.upload.map(r => r.speed),
+                            backgroundColor: 'rgba(54, 162, 235, 0.7)',
+                            borderColor: 'rgba(54, 162, 235, 1)',
+                            borderWidth: 1
+                        },
+                        {
+                            label: 'Download - Velocidade (MB/s)',
+                            data: this.benchmarkResults.download.map(r => r.speed),
+                            backgroundColor: 'rgba(75, 192, 192, 0.7)',
+                            borderColor: 'rgba(75, 192, 192, 1)',
+                            borderWidth: 1
+                        }
+                    ]
+                },
+                options: {
+                    ...baseChartOptions,
+                    plugins: {
+                        ...baseChartOptions.plugins,
+                        title: {
+                            display: true,
+                            text: 'Velocidade de Transferência',
+                            font: { size: 16 }
+                        }
+                    },
+                    scales: {
+                        ...baseChartOptions.scales,
+                        y: {
+                            ...baseChartOptions.scales.y,
+                            title: {
+                                display: true,
+                                text: 'Velocidade (MB/s)'
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Gráfico de Uso de CPU
+            const cpuChartConfig = {
+                type: 'line' as const,
+                data: {
+                    labels: this.benchmarkResults.upload.map(r => `${r.fileSize}MB`),
+                    datasets: [
+                        {
+                            label: 'Upload - Uso de CPU (%)',
+                            data: this.benchmarkResults.upload.map(r => r.cpuUsage),
+                            backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                            borderColor: 'rgba(255, 99, 132, 1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            fill: true
+                        },
+                        {
+                            label: 'Download - Uso de CPU (%)',
+                            data: this.benchmarkResults.download.map(r => r.cpuUsage),
+                            backgroundColor: 'rgba(255, 159, 64, 0.2)',
+                            borderColor: 'rgba(255, 159, 64, 1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            fill: true
+                        }
+                    ]
+                },
+                options: {
+                    ...baseChartOptions,
+                    plugins: {
+                        ...baseChartOptions.plugins,
+                        title: {
+                            display: true,
+                            text: 'Uso de CPU',
+                            font: { size: 16 }
+                        }
+                    },
+                    scales: {
+                        ...baseChartOptions.scales,
+                        y: {
+                            ...baseChartOptions.scales.y,
+                            title: {
+                                display: true,
+                                text: 'Uso de CPU (%)'
+                            },
+                            max: 100
+                        }
+                    }
+                }
+            };
+
+            // Gráfico de Uso de Memória
+            const memoryChartConfig = {
+                type: 'line' as const,
+                data: {
+                    labels: this.benchmarkResults.upload.map(r => `${r.fileSize}MB`),
+                    datasets: [
+                        {
+                            label: 'Upload - Uso de Memória (MB)',
+                            data: this.benchmarkResults.upload.map(r => r.memoryUsage),
+                            backgroundColor: 'rgba(153, 102, 255, 0.2)',
+                            borderColor: 'rgba(153, 102, 255, 1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            fill: true
+                        },
+                        {
+                            label: 'Download - Uso de Memória (MB)',
+                            data: this.benchmarkResults.download.map(r => r.memoryUsage),
+                            backgroundColor: 'rgba(201, 203, 207, 0.2)',
+                            borderColor: 'rgba(201, 203, 207, 1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            fill: true
+                        }
+                    ]
+                },
+                options: {
+                    ...baseChartOptions,
+                    plugins: {
+                        ...baseChartOptions.plugins,
+                        title: {
+                            display: true,
+                            text: 'Uso de Memória',
+                            font: { size: 16 }
+                        }
+                    },
+                    scales: {
+                        ...baseChartOptions.scales,
+                        y: {
+                            ...baseChartOptions.scales.y,
+                            title: {
+                                display: true,
+                                text: 'Uso de Memória (MB)'
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Gerar as imagens
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const speedImage = await chartJSNodeCanvas.renderToBuffer(speedChartConfig);
+            const cpuImage = await chartJSNodeCanvas.renderToBuffer(cpuChartConfig);
+            const memoryImage = await chartJSNodeCanvas.renderToBuffer(memoryChartConfig);
+
+            // Salvar os arquivos
+            await Promise.all([
+                fs.writeFile(`benchmark-speed-${timestamp}.png`, speedImage),
+                fs.writeFile(`benchmark-cpu-${timestamp}.png`, cpuImage),
+                fs.writeFile(`benchmark-memory-${timestamp}.png`, memoryImage)
+            ]);
+
+            console.log('Gráficos de benchmark gerados com sucesso!');
+            console.log(`- Velocidade: benchmark-speed-${timestamp}.png`);
+            console.log(`- CPU: benchmark-cpu-${timestamp}.png`);
+            console.log(`- Memória: benchmark-memory-${timestamp}.png`);
+        } catch (err) {
+            console.error('Erro ao gerar gráficos:', err);
+        }
+    }
     public start() {
         this.server.bindAsync(
             `0.0.0.0:${this.port}`,

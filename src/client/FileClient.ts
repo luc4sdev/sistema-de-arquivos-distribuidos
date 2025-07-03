@@ -113,28 +113,66 @@ export class FileClient {
         });
     }
 
-    public async downloadFile(remotePath: string, outputName?: string): Promise<FileOperationResponse> {
+    public async downloadFile(
+        remotePath: string,
+        outputName?: string
+    ): Promise<FileOperationResponse> {
         return new Promise((resolve, reject) => {
-            this.client.DownloadFile({
-                path: remotePath,
-                output_name: outputName
-            }, (err: any, response: any) => {
-                if (err) {
-                    reject(err);
-                    return;
+
+            /* ----------------------------------------------------------
+             * 1.  Abre stream gRPC ― server‑streaming
+             * -------------------------------------------------------- */
+            const call = this.client.DownloadFile({ path: remotePath });
+
+            /* variáveis de controle */
+            let totalChunks = 0;
+            let received = 0;
+            let writeStream: fs.WriteStream | null = null;
+            const startedAt = Date.now();
+
+            /* ----------------------------------------------------------
+             * 2.  Evento “data”  →  grava pedaço
+             * -------------------------------------------------------- */
+            call.on('data', (chunkMsg: any) => {
+                /* abre o arquivo no primeiro pedaço */
+                if (!writeStream) {
+                    totalChunks = chunkMsg.total_chunks;                 // meta
+                    const outDir = path.resolve(__dirname, '../../downloads');
+                    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+                    const fname = outputName || path.basename(remotePath);
+                    writeStream = fs.createWriteStream(path.join(outDir, fname));
                 }
-                console.log('Download arquivo:', response, `Tempo: ${response.timeMs}ms`);
-                if (response.content && response.filename) {
-                    const decodedContent = Buffer.from(response.content, 'base64');
-                    const outputDir = path.resolve(__dirname, '../../', 'localFiles');
-                    if (!fs.existsSync(outputDir)) {
-                        fs.mkdirSync(outputDir, { recursive: true });
-                    }
-                    const localPath = path.join(outputDir, outputName || response.filename);
-                    fs.writeFileSync(localPath, decodedContent);
-                    console.log(`Arquivo ${response.filename} baixado com sucesso!`);
-                }
-                resolve(response);
+
+                writeStream!.write(chunkMsg.chunk);                     // grava bytes
+                received++;
+                process.stdout.write(
+                    `\r⬇️  recebidos ${received}/${totalChunks} chunks…`
+                );
+            });
+
+            /* ----------------------------------------------------------
+             * 3.  Tratamento de erro
+             * -------------------------------------------------------- */
+            call.on('error', (err: any) => {
+                if (writeStream) writeStream.close();
+                console.error('\nErro no stream de download:', err.message);
+                reject(err);
+            });
+
+            /* ----------------------------------------------------------
+             * 4.  Stream terminado
+             * -------------------------------------------------------- */
+            call.on('end', () => {
+                if (writeStream) writeStream.end();
+                const dt = Date.now() - startedAt;
+                console.log(`\n✅ Download concluído em ${dt} ms`);
+
+                resolve({
+                    status: 'success',
+                    message: 'download completo',
+                    time_ms: dt
+                } as FileOperationResponse);
             });
         });
     }
