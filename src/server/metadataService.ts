@@ -111,6 +111,20 @@ export class MetadataService {
             .map(([id]) => id);
     }
 
+    public getAvailableNodesForUpload(): Array<{
+        id: string;
+        storageUsed: number;
+        storageCapacity: number;
+    }> {
+        return [...this.nodeStatus]
+            .filter(([, status]) => status.status === 'ONLINE')
+            .map(([id, status]) => ({
+                id,
+                storageUsed: status.storageUsed || 0,
+                storageCapacity: status.storageCapacity || 0
+            }));
+    }
+
     public findNewReplicaCandidates(exclude: string[] = []) {
         return this.getAvailableNodes()
             .filter(n => !exclude.includes(n))

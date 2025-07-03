@@ -269,18 +269,42 @@ export class GRPCServer {
                 const processPromise = (async () => {
                     try {
                         await this.metadataService.loadAllFromRedis();
-                        const availableNodes = this.metadataService.getAvailableNodes();
+                        const availableNodes = this.metadataService.getAvailableNodesForUpload();
 
                         if (availableNodes.length < 2) {
                             throw new Error('Nós insuficientes para replicação');
                         }
 
-                        const primaryNode = availableNodes[chunkNumber % availableNodes.length];
-                        const replicaNode = availableNodes[(chunkNumber + 1) % availableNodes.length];
-                        const targetNodes = [primaryNode, replicaNode];
+                        // Ordena os nós por espaço disponível (do maior para o menor)
+                        const sortedNodes = [...availableNodes].sort((a, b) => {
+                            const aAvailable = a.storageCapacity - a.storageUsed;
+                            const bAvailable = b.storageCapacity - b.storageUsed;
+                            return bAvailable - aAvailable; // Ordem decrescente
+                        });
 
-                        // 3. Armazena distribuição ANTES de enviar para evitar race condition
-                        chunkDistribution[chunkNumber] = targetNodes;
+                        // Seleção do nó primário e réplica
+                        let primaryNode, replicaNode;
+
+                        // Tenta selecionar os 2 nós com mais espaço disponível
+                        if (sortedNodes.length >= 2) {
+                            primaryNode = sortedNodes[0].id;
+                            replicaNode = sortedNodes[1].id;
+                        } else {
+                            // Fallback para o método anterior se houver exatamente 2 nós
+                            primaryNode = sortedNodes[0].id;
+                            replicaNode = sortedNodes[1 % sortedNodes.length].id;
+                        }
+
+                        // Garante que a réplica seja diferente do primário (para caso de array com 1 único nó)
+                        if (primaryNode === replicaNode && sortedNodes.length > 1) {
+                            // Seleciona o próximo nó com mais espaço disponível que não seja o primário
+                            const alternativeReplica = sortedNodes.find(node => node.id !== primaryNode);
+                            if (alternativeReplica) {
+                                replicaNode = alternativeReplica.id;
+                            }
+                        }
+
+                        const targetNodes = [primaryNode, replicaNode];
 
                         // 4. Envio paralelo com tratamento de erro
                         await Promise.all(
